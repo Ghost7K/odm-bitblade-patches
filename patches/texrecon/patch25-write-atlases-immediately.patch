@@ -1,0 +1,180 @@
+diff --git a/apps/texrecon/texrecon.cpp b/apps/texrecon/texrecon.cpp
+index 156a6fb..e22a207 100644
+--- a/apps/texrecon/texrecon.cpp
++++ b/apps/texrecon/texrecon.cpp
+@@ -76,6 +76,12 @@ int main(int argc, char **argv) {
+         omp_set_num_threads(conf.num_threads);
+     }
+ 
++    /* bitblade Patch 25: Atlanten sofort schreiben (BITBLADE_TEX_STREAM=0 schaltet ab) */
++    {
++        const char* e = std::getenv("BITBLADE_TEX_STREAM");
++        if (!(e && e[0] == '0')) conf.settings.bb_stream_prefix = conf.out_prefix;
++    }
++
+     std::cout << "Load and prepare mesh: " << std::endl;
+     mve::TriangleMesh::Ptr mesh;
+     try {
+diff --git a/libs/tex/build_obj_model.cpp b/libs/tex/build_obj_model.cpp
+index 9efc222..05bd444 100644
+--- a/libs/tex/build_obj_model.cpp
++++ b/libs/tex/build_obj_model.cpp
+@@ -66,8 +66,9 @@ build_model(mve::TriangleMesh::ConstPtr mesh,
+         const std::size_t n = material_lib.size();
+         material.name = std::string("material") + util::string::get_filled(n, 4);
+         material.diffuse_map = texture_atlas->get_image();
++        material.bb_prewritten = texture_atlas->bb_is_written();
+ 
+-        if (texture_atlas->is_grayscale()){
++        if (!material.bb_prewritten && texture_atlas->is_grayscale()){
+             // Use only first channel (other two should be the same)
+             if (material.diffuse_map->get_type() == mve::IMAGE_TYPE_FLOAT){
+                 material.diffuse_map = condense_grayscale<float>(std::dynamic_pointer_cast<mve::FloatImage>(texture_atlas->get_image()));
+diff --git a/libs/tex/generate_texture_atlases.cpp b/libs/tex/generate_texture_atlases.cpp
+index 4830beb..5356988 100644
+--- a/libs/tex/generate_texture_atlases.cpp
++++ b/libs/tex/generate_texture_atlases.cpp
+@@ -13,6 +13,7 @@
+ #include <fstream>
+ 
+ #include <util/timer.h>
++#include <util/strings.h>
+ #include <mve/image_tools.h>
+ 
+ #include "defines.h"
+@@ -138,7 +139,7 @@ generate_texture_atlases(std::vector<TexturePatch::Ptr> * orig_texture_patches,
+      * runs on worker threads while the next atlas is being packed. Each atlas
+      * is finalized independently -> identical result; validity masks are
+      * still released atlas by atlas. */
+-    std::deque<TextureAtlas::Ptr> fin_queue;
++    std::deque<std::pair<TextureAtlas::Ptr, std::size_t> > fin_queue;
+     std::mutex fin_mutex;
+     std::condition_variable fin_cv;
+     bool fin_done = false;
+@@ -152,15 +153,21 @@ generate_texture_atlases(std::vector<TexturePatch::Ptr> * orig_texture_patches,
+         fin_threads.emplace_back([&]() {
+             for (;;) {
+                 TextureAtlas::Ptr atlas;
++                std::size_t atlas_idx = 0;
+                 {
+                     std::unique_lock<std::mutex> lock(fin_mutex);
+                     fin_cv.wait(lock, [&]() { return fin_done || !fin_queue.empty(); });
+                     if (fin_queue.empty()) return;
+-                    atlas = fin_queue.front();
++                    atlas = fin_queue.front().first;
++                    atlas_idx = fin_queue.front().second;
+                     fin_queue.pop_front();
+                 }
+                 try {
+                     atlas->finalize();
++                    if (!settings.bb_stream_prefix.empty()) {
++                        atlas->bb_write_and_release(settings.bb_stream_prefix + "_material"
++                            + util::string::get_filled(atlas_idx, 4) + "_map_Kd.png");
++                    }
+                 } catch (...) {
+                     std::lock_guard<std::mutex> lock(fin_mutex);
+                     if (!fin_error) fin_error = std::current_exception();
+@@ -208,7 +215,7 @@ generate_texture_atlases(std::vector<TexturePatch::Ptr> * orig_texture_patches,
+         }
+         {
+             std::lock_guard<std::mutex> lock(fin_mutex);
+-            fin_queue.push_back(texture_atlas);
++            fin_queue.push_back(std::make_pair(texture_atlas, texture_atlases->size() - 1));
+         }
+         fin_cv.notify_one();
+     }
+diff --git a/libs/tex/material_lib.cpp b/libs/tex/material_lib.cpp
+index 29f14fc..f611091 100644
+--- a/libs/tex/material_lib.cpp
++++ b/libs/tex/material_lib.cpp
+@@ -30,8 +30,8 @@ MaterialLib::save_to_files(std::string const & prefix) const {
+     for (Material const & material : *this) {
+         std::string diffuse_map_postfix = "_" + material.name + "_map_Kd";
+         std::string ext = ".png";
+-        if (material.diffuse_map->get_type() == mve::IMAGE_TYPE_UINT16 ||
+-            material.diffuse_map->get_type() == mve::IMAGE_TYPE_FLOAT){
++        if (!material.bb_prewritten && (material.diffuse_map->get_type() == mve::IMAGE_TYPE_UINT16 ||
++            material.diffuse_map->get_type() == mve::IMAGE_TYPE_FLOAT)){
+             ext = ".tif";
+         }
+ 
+@@ -56,6 +56,7 @@ MaterialLib::save_to_files(std::string const & prefix) const {
+     for (std::int64_t mi = 0; mi < mats.size(); ++mi) {
+ #endif
+         Material const & material = *mats[mi];
++        if (material.bb_prewritten) continue; /* bitblade Patch 25: schon geschrieben */
+         std::string filename = prefix + "_" + material.name + "_map_Kd";
+         if (material.diffuse_map->get_type() == mve::IMAGE_TYPE_FLOAT){
+             mve::image::save_tiff_float_file(std::dynamic_pointer_cast<mve::FloatImage>(material.diffuse_map), filename + ".tif");
+diff --git a/libs/tex/material_lib.h b/libs/tex/material_lib.h
+index b8a9bb3..97cbaa9 100644
+--- a/libs/tex/material_lib.h
++++ b/libs/tex/material_lib.h
+@@ -16,6 +16,7 @@
+ struct Material {
+     std::string name;
+     mve::ImageBase::Ptr diffuse_map;
++    bool bb_prewritten = false; /* Patch 25: PNG bereits geschrieben */
+ };
+ 
+ /**
+diff --git a/libs/tex/settings.h b/libs/tex/settings.h
+index b75645d..82182ee 100644
+--- a/libs/tex/settings.h
++++ b/libs/tex/settings.h
+@@ -95,6 +95,10 @@ struct Settings {
+     bool nadir_mode = false;
+ 
+     int max_texture_size = 8 * 1024;
++
++    /* bitblade Patch 25: Atlanten sofort nach dem Fertigstellen als PNG schreiben und aus dem RAM entfernen
++     * (leer = aus). Wird von texrecon auf das Ausgabe-Praefix gesetzt; BITBLADE_TEX_STREAM=0 schaltet ab. */
++    std::string bb_stream_prefix;
+ };
+ 
+ TEX_NAMESPACE_END
+diff --git a/libs/tex/texture_atlas.cpp b/libs/tex/texture_atlas.cpp
+index cb87ebb..bd53d6e 100644
+--- a/libs/tex/texture_atlas.cpp
++++ b/libs/tex/texture_atlas.cpp
+@@ -278,6 +278,17 @@ struct VectorCompare {
+ 
+ typedef std::map<math::Vec2f, std::size_t, VectorCompare> TexcoordMap;
+ 
++bool
++TextureAtlas::bb_write_and_release(std::string const & filename) {
++    if (!finalized || bb_written || grayscale || image == nullptr
++        || image->get_type() != mve::IMAGE_TYPE_UINT8) return false;
++    mve::image::save_png_file(std::dynamic_pointer_cast<mve::ByteImage>(image), filename);
++    image.reset();
++    validity_mask.reset();
++    bb_written = true;
++    return true;
++}
++
+ void
+ TextureAtlas::merge_texcoords() {
+     Texcoords tmp; tmp.swap(this->texcoords);
+diff --git a/libs/tex/texture_atlas.h b/libs/tex/texture_atlas.h
+index b41ed5d..2b72beb 100644
+--- a/libs/tex/texture_atlas.h
++++ b/libs/tex/texture_atlas.h
+@@ -45,6 +45,8 @@ class TextureAtlas {
+ 
+         mve::ImageBase::Ptr image;
+         mve::ByteImage::Ptr validity_mask;
++        /* bitblade Patch 25 */
++        bool bb_written = false;
+ 
+         RectangularBin::Ptr bin;
+ 
+@@ -67,6 +69,9 @@ class TextureAtlas {
+ 
+         void finalize(void);
+         bool is_grayscale();
++        /** Patch 25: PNG schreiben und Bilddaten freigeben (nur 8 Bit, farbig) */
++        bool bb_write_and_release(std::string const & filename);
++        bool bb_is_written(void) const { return bb_written; }
+ };
+ 
+ inline TextureAtlas::Ptr

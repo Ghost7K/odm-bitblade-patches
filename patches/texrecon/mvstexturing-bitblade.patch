@@ -1,0 +1,850 @@
+diff --git a/libs/tex/generate_texture_atlases.cpp b/libs/tex/generate_texture_atlases.cpp
+index 07cabfb..ffa6041 100644
+--- a/libs/tex/generate_texture_atlases.cpp
++++ b/libs/tex/generate_texture_atlases.cpp
+@@ -17,6 +17,14 @@
+ 
+ #include "defines.h"
+ #include "settings.h"
++#include <thread>
++#include <mutex>
++#include <condition_variable>
++#include <deque>
++#include <exception>
++#ifdef _OPENMP
++#include <omp.h>
++#endif
+ #include "histogram.h"
+ #include "texture_patch.h"
+ #include "texture_atlas.h"
+@@ -119,10 +127,51 @@ generate_texture_atlases(std::vector<TexturePatch::Ptr> * orig_texture_patches,
+ #else
+     std::ostream &tty = std::cout;
+ #endif
+-    // #pragma omp parallel
+-    // {
+-    // #pragma omp single
+-    // {
++    /* bitblade: finalize() (edge padding + texcoord merge) of a full atlas
++     * runs on worker threads while the next atlas is being packed. Each atlas
++     * is finalized independently -> identical result; validity masks are
++     * still released atlas by atlas. */
++    std::deque<TextureAtlas::Ptr> fin_queue;
++    std::mutex fin_mutex;
++    std::condition_variable fin_cv;
++    bool fin_done = false;
++    std::exception_ptr fin_error = nullptr;
++    unsigned int num_fin_threads = std::max(1u, std::thread::hardware_concurrency());
++#ifdef _OPENMP
++    num_fin_threads = std::max(1, omp_get_max_threads());
++#endif
++    std::vector<std::thread> fin_threads;
++    for (unsigned int t = 0; t < num_fin_threads; ++t) {
++        fin_threads.emplace_back([&]() {
++            for (;;) {
++                TextureAtlas::Ptr atlas;
++                {
++                    std::unique_lock<std::mutex> lock(fin_mutex);
++                    fin_cv.wait(lock, [&]() { return fin_done || !fin_queue.empty(); });
++                    if (fin_queue.empty()) return;
++                    atlas = fin_queue.front();
++                    fin_queue.pop_front();
++                }
++                try {
++                    atlas->finalize();
++                } catch (...) {
++                    std::lock_guard<std::mutex> lock(fin_mutex);
++                    if (!fin_error) fin_error = std::current_exception();
++                }
++            }
++        });
++    }
++
++    /* Join the finalize threads on every exit path (also on exceptions). */
++    struct FinGuard {
++        std::mutex & m; std::condition_variable & cv; bool & done;
++        std::vector<std::thread> & threads;
++        ~FinGuard() {
++            { std::lock_guard<std::mutex> lock(m); done = true; }
++            cv.notify_all();
++            for (std::thread & t : threads) if (t.joinable()) t.join();
++        }
++    } fin_guard{fin_mutex, fin_cv, fin_done, fin_threads};
+ 
+     while (!texture_patches.empty()) {
+         unsigned int texture_size = calculate_texture_size(texture_patches, settings);
+@@ -150,25 +199,25 @@ generate_texture_atlases(std::vector<TexturePatch::Ptr> * orig_texture_patches,
+                 ++it;
+             }
+         }
+-// #if !defined(_MSC_VER)
+-//         #pragma omp task
+-// #endif
+-        texture_atlas->finalize();
++        {
++            std::lock_guard<std::mutex> lock(fin_mutex);
++            fin_queue.push_back(texture_atlas);
++        }
++        fin_cv.notify_one();
+     }
+ 
+     std::cout << "\r\tWorking on atlas " << texture_atlases->size()
+         << " 100%... done." << std::endl;
+     util::WallTimer timer;
+     std::cout << "\tFinalizing texture atlases... " << std::flush;
+-// #if !defined(_MSC_VER)
+-//     #pragma omp taskwait
+-// #endif
++    {
++        std::lock_guard<std::mutex> lock(fin_mutex);
++        fin_done = true;
++    }
++    fin_cv.notify_all();
++    for (std::thread & t : fin_threads) if (t.joinable()) t.join();
++    if (fin_error) std::rethrow_exception(fin_error);
+     std::cout << "done. (Took: " << timer.get_elapsed_sec() << "s)" << std::endl;
+-
+-    // /* End of single region */
+-    // }
+-    // /* End of parallel region. */
+-    // }
+ }
+ 
+ TEX_NAMESPACE_END
+diff --git a/libs/tex/generate_texture_patches.cpp b/libs/tex/generate_texture_patches.cpp
+index ac1e375..1b953c8 100644
+--- a/libs/tex/generate_texture_patches.cpp
++++ b/libs/tex/generate_texture_patches.cpp
+@@ -151,10 +151,15 @@ generate_candidate(int label, TextureView const & texture_view,
+     return texture_patch_candidate;
+ }
+ 
++/* bitblade: fill_hole no longer writes into the shared structures. It reads
++ * vertex_projection_infos (not modified while holes are filled in parallel)
++ * and returns the new patch plus its vertex projection infos; the caller
++ * appends them serially in hole order (deterministic patch IDs). */
+ bool fill_hole(std::vector<std::size_t> const & hole, UniGraph const & graph,
+     mve::TriangleMesh::ConstPtr mesh, mve::MeshInfo const & mesh_info,
+-    std::vector<std::vector<VertexProjectionInfo> > * vertex_projection_infos,
+-    std::vector<TexturePatch::Ptr> * texture_patches) {
++    std::vector<std::vector<VertexProjectionInfo> > const * vertex_projection_infos,
++    TexturePatch::Ptr * out_patch,
++    std::vector<std::pair<std::size_t, VertexProjectionInfo> > * out_vpis) {
+ 
+     mve::TriangleMesh::FaceList const & mesh_faces = mesh->get_faces();
+     mve::TriangleMesh::VertexList const & vertices = mesh->get_vertices();
+@@ -296,12 +301,8 @@ bool fill_hole(std::vector<std::size_t> const & hole, UniGraph const & graph,
+     for (std::size_t j = 0; j < border.size(); ++j) {
+         std::size_t vi0 = border[j];
+         std::size_t vi1 = border[(j + 1) % border.size()];
+-        std::vector<VertexProjectionInfo> vpi0, vpi1;
+-        #pragma omp critical (vpis)
+-        {
+-            vpi0 = vertex_projection_infos->at(vi0);
+-            vpi1 = vertex_projection_infos->at(vi1);
+-        }
++        std::vector<VertexProjectionInfo> const & vpi0 = vertex_projection_infos->at(vi0);
++        std::vector<VertexProjectionInfo> const & vpi1 = vertex_projection_infos->at(vi1);
+ 
+         /* According to the previous checks (vertex class within the origial
+          * mesh and boundary) there has to be at least one projection
+@@ -436,12 +437,8 @@ bool fill_hole(std::vector<std::size_t> const & hole, UniGraph const & graph,
+     mve::FloatImage::Ptr image = mve::FloatImage::create(image_size, image_size, 3);
+     //DEBUG image->fill_color(*math::Vec4uc(0, 255, 0, 255));
+     TexturePatch::Ptr texture_patch = TexturePatch::create(0, hole, texcoords, image);
+-    std::size_t texture_patch_id;
+-    #pragma omp critical
+-    {
+-        texture_patches->push_back(texture_patch);
+-        texture_patch_id = texture_patches->size() - 1;
+-    }
++    *out_patch = texture_patch;
++    std::size_t const texture_patch_id = 0; /* set by caller */
+ 
+     for (std::size_t j = 0; j < num_vertices; ++j) {
+         std::size_t const vertex_id = l2g[j];
+@@ -453,8 +450,7 @@ bool fill_hole(std::vector<std::size_t> const & hole, UniGraph const & graph,
+             }
+         }
+         VertexProjectionInfo info = {texture_patch_id, projections[j], faces};
+-        #pragma omp critical (vpis)
+-        vertex_projection_infos->at(vertex_id).push_back(info);
++        out_vpis->push_back(std::make_pair(vertex_id, info));
+     }
+ 
+     return true;
+@@ -476,6 +472,19 @@ generate_texture_patches(UniGraph const & graph, mve::TriangleMesh::ConstPtr mes
+     std::size_t num_patches = 0;
+ 
+     std::cout << "\tRunning... " << std::flush;
++
++    /* bitblade: all subgraphs of all labels in ONE pass over the graph. The
++     * original called graph.get_subgraphs(label) per view, i.e. scanned all
++     * faces once per view (O(views x faces)). Content/order per label is
++     * identical. */
++    std::vector<std::vector<std::vector<std::size_t> > >
++        subgraphs_per_label(texture_views->size() + 1);
++    graph.get_all_subgraphs(&subgraphs_per_label);
++
++    /* bitblade: candidates per view in parallel, patches appended serially in
++     * view order afterwards -> deterministic patch IDs, no critical sections. */
++    std::vector<std::vector<TexturePatch::Ptr> > view_patches(texture_views->size());
++
+     #pragma omp parallel for schedule(dynamic)
+ #if !defined(_MSC_VER)
+     for (std::size_t i = 0; i < texture_views->size(); ++i) {
+@@ -483,9 +492,9 @@ generate_texture_patches(UniGraph const & graph, mve::TriangleMesh::ConstPtr mes
+     for (std::int64_t i = 0; i < texture_views->size(); ++i) {
+ #endif
+ 
+-        std::vector<std::vector<std::size_t> > subgraphs;
++        std::vector<std::vector<std::size_t> > & subgraphs = subgraphs_per_label[i + 1];
++        if (subgraphs.empty()) continue;
+         int const label = i + 1;
+-        graph.get_subgraphs(label, &subgraphs);
+ 
+         TextureView * texture_view = &texture_views->at(i);
+         texture_view->load_image();
+@@ -494,6 +503,7 @@ generate_texture_patches(UniGraph const & graph, mve::TriangleMesh::ConstPtr mes
+             candidates.push_back(generate_candidate(label, *texture_view, subgraphs[j], mesh, settings));
+         }
+         texture_view->release_image();
++        std::vector<std::vector<std::size_t> >().swap(subgraphs);
+ 
+         /* Merge candidates which contain the same image content. */
+         std::list<TexturePatchCandidate>::iterator it, sit;
+@@ -521,18 +531,20 @@ generate_texture_patches(UniGraph const & graph, mve::TriangleMesh::ConstPtr mes
+             }
+         }
+ 
+-        it = candidates.begin();
+-        for (; it != candidates.end(); ++it) {
+-            std::size_t texture_patch_id;
++        for (it = candidates.begin(); it != candidates.end(); ++it) {
++            view_patches[i].push_back(it->texture_patch);
++        }
++    }
+ 
+-            #pragma omp critical
+-            {
+-                texture_patches->push_back(it->texture_patch);
+-                texture_patch_id = num_patches++;
+-            }
++    /* Serial, ordered assembly. */
++    for (std::size_t v = 0; v < view_patches.size(); ++v) {
++        for (TexturePatch::Ptr const & texture_patch : view_patches[v]) {
++            std::size_t const texture_patch_id = texture_patches->size();
++            texture_patches->push_back(texture_patch);
++            num_patches += 1;
+ 
+-            std::vector<std::size_t> const & faces = it->texture_patch->get_faces();
+-            std::vector<math::Vec2f> const & texcoords = it->texture_patch->get_texcoords();
++            std::vector<std::size_t> const & faces = texture_patch->get_faces();
++            std::vector<math::Vec2f> const & texcoords = texture_patch->get_texcoords();
+             for (std::size_t i = 0; i < faces.size(); ++i) {
+                 std::size_t const face_id = faces[i];
+                 std::size_t const face_pos = face_id * 3;
+@@ -541,43 +553,51 @@ generate_texture_patches(UniGraph const & graph, mve::TriangleMesh::ConstPtr mes
+                     math::Vec2f const projection = texcoords[i * 3 + j];
+ 
+                     VertexProjectionInfo info = {texture_patch_id, projection, {face_id}};
+-
+-                    #pragma omp critical
+                     vertex_projection_infos->at(vertex_id).push_back(info);
+                 }
+             }
+         }
++        std::vector<TexturePatch::Ptr>().swap(view_patches[v]);
+     }
+ 
+     merge_vertex_projection_infos(vertex_projection_infos);
+ 
+     {
+         std::vector<std::size_t> unseen_faces;
+-        std::vector<std::vector<std::size_t> > subgraphs;
+-        graph.get_subgraphs(0, &subgraphs);
+-
+-        #pragma omp parallel for schedule(dynamic)
++        std::vector<std::vector<std::size_t> > & subgraphs = subgraphs_per_label[0];
++
++        /* bitblade: fill holes in parallel against the (now read-only)
++         * projection infos, then append results serially in hole order.
++         * Also fixes the unsynchronized num_patches += 1 of the original. */
++        std::vector<char> success(subgraphs.size(), 0);
++        std::vector<TexturePatch::Ptr> hole_patches(subgraphs.size());
++        std::vector<std::vector<std::pair<std::size_t, VertexProjectionInfo> > >
++            hole_vpis(subgraphs.size());
++
++        if (settings.hole_filling) {
++            #pragma omp parallel for schedule(dynamic)
+ #if !defined(_MSC_VER)
+-        for (std::size_t i = 0; i < subgraphs.size(); ++i) {
++            for (std::size_t i = 0; i < subgraphs.size(); ++i) {
+ #else
+-        for (std::int64_t i = 0; i < subgraphs.size(); ++i) {
++            for (std::int64_t i = 0; i < subgraphs.size(); ++i) {
+ #endif
+-            std::vector<std::size_t> const & subgraph = subgraphs[i];
+-
+-            bool success = false;
+-            if (settings.hole_filling) {
+-                success = fill_hole(subgraph, graph, mesh, mesh_info,
+-                    vertex_projection_infos, texture_patches);
++                success[i] = fill_hole(subgraphs[i], graph, mesh, mesh_info,
++                    vertex_projection_infos, &hole_patches[i], &hole_vpis[i]) ? 1 : 0;
+             }
++        }
+ 
+-            if (success) {
+-                num_patches += 1;
+-            } else {
+-                if (settings.keep_unseen_faces) {
+-                    #pragma omp critical
+-                    unseen_faces.insert(unseen_faces.end(),
+-                        subgraph.begin(), subgraph.end());
++        for (std::size_t i = 0; i < subgraphs.size(); ++i) {
++            if (success[i]) {
++                std::size_t const texture_patch_id = texture_patches->size();
++                texture_patches->push_back(hole_patches[i]);
++                for (auto & vi : hole_vpis[i]) {
++                    vi.second.texture_patch_id = texture_patch_id;
++                    vertex_projection_infos->at(vi.first).push_back(vi.second);
+                 }
++                num_patches += 1;
++            } else if (settings.keep_unseen_faces) {
++                unseen_faces.insert(unseen_faces.end(),
++                    subgraphs[i].begin(), subgraphs[i].end());
+             }
+         }
+ 
+diff --git a/libs/tex/global_seam_leveling.cpp b/libs/tex/global_seam_leveling.cpp
+index ac2402c..0619f32 100644
+--- a/libs/tex/global_seam_leveling.cpp
++++ b/libs/tex/global_seam_leveling.cpp
+@@ -211,29 +211,48 @@ global_seam_leveling(UniGraph const & graph, mve::TriangleMesh::ConstPtr mesh,
+     std::vector<Eigen::Triplet<float, int> > coefficients_A;
+     std::vector<math::Vec3f> coefficients_b;
+     std::size_t A_row = 0;
+-    for (std::size_t i = 0; i < num_vertices; ++i) {
+-        for (std::size_t j = 0; j < labels[i].size(); ++j) {
+-            for (std::size_t k = 0; k < labels[i].size(); ++k) {
+-                std::size_t label1 = labels[i][j];
+-                std::size_t label2 = labels[i][k];
+-                if (label1 < label2) {
+-
+-                    std::vector<MeshEdge> seam_edges;
+-                    find_seam_edges_for_vertex_label_combination(graph, mesh, mesh_info, i, label1, label2, &seam_edges);
+-
+-                    if (seam_edges.empty()) continue;
++    {
++        /* bitblade: the per-vertex work (seam search + color differences) is
++         * independent -> computed in parallel; rows are then appended
++         * serially in the original order (identical matrix). */
++        struct ARow { std::size_t label1, label2; math::Vec3f b; };
++        std::vector<std::vector<ARow> > rows_per_vertex(num_vertices);
++        #pragma omp parallel for schedule(dynamic, 1024)
++#if !defined(_MSC_VER)
++        for (std::size_t i = 0; i < num_vertices; ++i) {
++#else
++        for (std::int64_t i = 0; i < num_vertices; ++i) {
++#endif
++            for (std::size_t j = 0; j < labels[i].size(); ++j) {
++                for (std::size_t k = 0; k < labels[i].size(); ++k) {
++                    std::size_t label1 = labels[i][j];
++                    std::size_t label2 = labels[i][k];
++                    if (label1 < label2) {
+ 
+-                    Eigen::Triplet<float, int> t1(A_row, vertlabel2row[i][label1], 1.0f);
+-                    Eigen::Triplet<float, int> t2(A_row, vertlabel2row[i][label2], -1.0f);
+-                    coefficients_A.push_back(t1);
+-                    coefficients_A.push_back(t2);
++                        std::vector<MeshEdge> seam_edges;
++                        find_seam_edges_for_vertex_label_combination(graph, mesh, mesh_info, i, label1, label2, &seam_edges);
+ 
+-                    coefficients_b.push_back(calculate_difference(vertex_projection_infos, mesh, *texture_patches, seam_edges, label1, label2));
++                        if (seam_edges.empty()) continue;
+ 
+-                    ++A_row;
++                        ARow row = {label1, label2,
++                            calculate_difference(vertex_projection_infos, mesh, *texture_patches, seam_edges, label1, label2)};
++                        rows_per_vertex[i].push_back(row);
++                    }
+                 }
+             }
+         }
++
++        for (std::size_t i = 0; i < num_vertices; ++i) {
++            for (ARow const & row : rows_per_vertex[i]) {
++                Eigen::Triplet<float, int> t1(A_row, vertlabel2row[i][row.label1], 1.0f);
++                Eigen::Triplet<float, int> t2(A_row, vertlabel2row[i][row.label2], -1.0f);
++                coefficients_A.push_back(t1);
++                coefficients_A.push_back(t2);
++                coefficients_b.push_back(row.b);
++                ++A_row;
++            }
++            std::vector<ARow>().swap(rows_per_vertex[i]);
++        }
+     }
+ 
+     std::size_t A_rows = A_row;
+diff --git a/libs/tex/local_seam_leveling.cpp b/libs/tex/local_seam_leveling.cpp
+index 5decf4b..3a13a1b 100644
+--- a/libs/tex/local_seam_leveling.cpp
++++ b/libs/tex/local_seam_leveling.cpp
+@@ -122,7 +122,13 @@ local_seam_leveling(UniGraph const & graph, mve::TriangleMesh::ConstPtr mesh,
+         find_seam_edges(graph, mesh, &seam_edges);
+         edge_colors.resize(seam_edges.size());
+         edge_projection_infos.resize(seam_edges.size());
++        /* bitblade: independent per edge -> parallel */
++        #pragma omp parallel for schedule(dynamic, 1024)
++#if !defined(_MSC_VER)
+         for (std::size_t i = 0; i < seam_edges.size(); ++i) {
++#else
++        for (std::int64_t i = 0; i < seam_edges.size(); ++i) {
++#endif
+             MeshEdge const & seam_edge = seam_edges[i];
+             find_mesh_edge_projections(vertex_projection_infos, seam_edge,
+                 &edge_projection_infos[i]);
+@@ -131,8 +137,14 @@ local_seam_leveling(UniGraph const & graph, mve::TriangleMesh::ConstPtr mesh,
+ 
+     std::vector<std::vector<Line> > lines(texture_patches->size());
+     std::vector<std::vector<Pixel> > pixels(texture_patches->size());
+-    /* Sample edge colors. */
++    /* Sample edge colors. bitblade: colors in parallel (read-only access to
++     * the patches), line lists filled serially in edge order afterwards. */
++    #pragma omp parallel for schedule(dynamic, 256)
++#if !defined(_MSC_VER)
+     for (std::size_t i = 0; i < edge_projection_infos.size(); ++i) {
++#else
++    for (std::int64_t i = 0; i < edge_projection_infos.size(); ++i) {
++#endif
+         /* Determine sampling (ensure at least two samples per edge). */
+         float max_length = 1;
+         for (EdgeProjectionInfo const & edge_projection_info : edge_projection_infos[i]) {
+@@ -146,7 +158,9 @@ local_seam_leveling(UniGraph const & graph, mve::TriangleMesh::ConstPtr mesh,
+             float t = static_cast<float>(j) / (edge_color.size() - 1);
+             edge_color[j] = mean_color_of_edge_point(edge_projection_infos[i], *texture_patches, t);
+         }
++    }
+ 
++    for (std::size_t i = 0; i < edge_projection_infos.size(); ++i) {
+         for (EdgeProjectionInfo const & edge_projection_info : edge_projection_infos[i]) {
+             Line line;
+             line.from = edge_projection_info.p1 + math::Vec2f(0.5f, 0.5f);
+@@ -156,22 +170,34 @@ local_seam_leveling(UniGraph const & graph, mve::TriangleMesh::ConstPtr mesh,
+         }
+     }
+ 
+-    /* Sample vertex colors. */
++    /* Sample vertex colors. bitblade: parallel, pixel lists filled serially. */
++    std::vector<char> has_vertex_color(vertex_colors.size(), 0);
++    #pragma omp parallel for schedule(dynamic, 4096)
++#if !defined(_MSC_VER)
+     for (std::size_t i = 0; i < vertex_colors.size(); ++i) {
++#else
++    for (std::int64_t i = 0; i < vertex_colors.size(); ++i) {
++#endif
+         std::vector<VertexProjectionInfo> const & projection_infos = vertex_projection_infos[i];
+         if (projection_infos.size() <= 1) continue;
+ 
+         math::Accum<math::Vec3f> color_accum(math::Vec3f(0.0f));
+         for (VertexProjectionInfo const & projection_info : projection_infos) {
+-            TexturePatch::Ptr texture_patch = texture_patches->at(projection_info.texture_patch_id);
++            TexturePatch::Ptr const & texture_patch = texture_patches->at(projection_info.texture_patch_id);
+             if (texture_patch->get_label() == 0) continue;
+             math::Vec3f color = texture_patch->get_pixel_value(projection_info.projection);
+             if (color[0] <= 0.9 && color[1] <= 0.9 && color[2] <= 0.9 &&
+                 color[0] >= 0.1 && color[1] >= 0.1 && color[2] >= 0.1) color_accum.add(color, 1.0f);
+         }
+-	if (color_accum.w == 0.0f) continue;
++        if (color_accum.w == 0.0f) continue;
+ 
+         vertex_colors[i] = color_accum.normalized();
++        has_vertex_color[i] = 1;
++    }
++
++    for (std::size_t i = 0; i < vertex_colors.size(); ++i) {
++        if (!has_vertex_color[i]) continue;
++        std::vector<VertexProjectionInfo> const & projection_infos = vertex_projection_infos[i];
+ 
+         for (VertexProjectionInfo const & projection_info : projection_infos) {
+             Pixel pixel;
+diff --git a/libs/tex/material_lib.cpp b/libs/tex/material_lib.cpp
+index 569369c..29f14fc 100644
+--- a/libs/tex/material_lib.cpp
++++ b/libs/tex/material_lib.cpp
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <fstream>
++#include <vector>
+ #include <cstring>
+ #include <cerrno>
+ 
+@@ -45,7 +46,16 @@ MaterialLib::save_to_files(std::string const & prefix) const {
+     }
+     out.close();
+ 
+-    for (Material const & material : *this) {
++    /* bitblade: write the texture files in parallel (independent files). */
++    std::vector<Material const *> mats;
++    for (Material const & material : *this) mats.push_back(&material);
++    #pragma omp parallel for schedule(dynamic)
++#if !defined(_MSC_VER)
++    for (std::size_t mi = 0; mi < mats.size(); ++mi) {
++#else
++    for (std::int64_t mi = 0; mi < mats.size(); ++mi) {
++#endif
++        Material const & material = *mats[mi];
+         std::string filename = prefix + "_" + material.name + "_map_Kd";
+         if (material.diffuse_map->get_type() == mve::IMAGE_TYPE_FLOAT){
+             mve::image::save_tiff_float_file(std::dynamic_pointer_cast<mve::FloatImage>(material.diffuse_map), filename + ".tif");
+diff --git a/libs/tex/obj_model.cpp b/libs/tex/obj_model.cpp
+index 46b256b..7f07c41 100644
+--- a/libs/tex/obj_model.cpp
++++ b/libs/tex/obj_model.cpp
+@@ -11,6 +11,11 @@
+ #include <fstream>
+ #include <cstring>
+ #include <cerrno>
++#include <cstdio>
++#include <functional>
++#include <string>
++#include <vector>
++#include <algorithm>
+ 
+ #include <mve/mesh.h>
+ #include <util/exception.h>
+@@ -36,36 +41,63 @@ ObjModel::save_to_files(std::string const & prefix) const {
+ 
+     out << "mtllib " << name << ".mtl" << '\n';
+ 
+-    out << std::fixed << std::setprecision(6);
+-    for (std::size_t i = 0; i < vertices.size(); ++i) {
+-        out << "v " << vertices[i][0] << " "
+-            << vertices[i][1] << " "
+-            << vertices[i][2] << '\n';
+-    }
++    /* bitblade: lines are formatted in parallel chunks with snprintf and
++     * written in order. "%.6f" on the float promoted to double is exactly
++     * what "std::fixed << std::setprecision(6) << float" produces (C locale),
++     * "%zu" matches "<< std::size_t". Output is byte-identical. */
++    auto write_chunked = [&out](std::size_t n,
++        std::function<int(std::size_t, char *, std::size_t)> fmt) {
++        std::size_t const chunk = 1 << 16;
++        std::size_t const num_chunks = (n + chunk - 1) / chunk;
++        std::size_t const batch = 64;
++        for (std::size_t b0 = 0; b0 < num_chunks; b0 += batch) {
++            std::size_t const b1 = std::min(num_chunks, b0 + batch);
++            std::vector<std::string> bufs(b1 - b0);
++            #pragma omp parallel for schedule(dynamic)
++#if !defined(_MSC_VER)
++            for (std::size_t c = b0; c < b1; ++c) {
++#else
++            for (std::int64_t c = b0; c < b1; ++c) {
++#endif
++                std::string & s = bufs[c - b0];
++                char line[256];
++                std::size_t const e = std::min(n, (c + 1) * chunk);
++                s.reserve((e - c * chunk) * 40);
++                for (std::size_t i = c * chunk; i < e; ++i) {
++                    int len = fmt(i, line, sizeof(line));
++                    s.append(line, len);
++                }
++            }
++            for (std::string const & s : bufs) out.write(s.data(), s.size());
++        }
++    };
+ 
+-    for (std::size_t i = 0; i < texcoords.size(); ++i) {
+-        out << "vt " << texcoords[i][0] << " "
+-            << 1.0f - texcoords[i][1] << '\n';
+-    }
++    write_chunked(vertices.size(), [this](std::size_t i, char * l, std::size_t sz) {
++        return std::snprintf(l, sz, "v %.6f %.6f %.6f\n",
++            (double) vertices[i][0], (double) vertices[i][1], (double) vertices[i][2]);
++    });
+ 
+-    for (std::size_t i = 0; i < normals.size(); ++i) {
+-        out << "vn " << normals[i][0] << " "
+-            << normals[i][1] << " "
+-            << normals[i][2] << '\n';
+-    }
++    write_chunked(texcoords.size(), [this](std::size_t i, char * l, std::size_t sz) {
++        float const v = 1.0f - texcoords[i][1];
++        return std::snprintf(l, sz, "vt %.6f %.6f\n",
++            (double) texcoords[i][0], (double) v);
++    });
++
++    write_chunked(normals.size(), [this](std::size_t i, char * l, std::size_t sz) {
++        return std::snprintf(l, sz, "vn %.6f %.6f %.6f\n",
++            (double) normals[i][0], (double) normals[i][1], (double) normals[i][2]);
++    });
+ 
+     for (std::size_t i = 0; i < groups.size(); ++i) {
+         out << "usemtl " << groups[i].material_name << '\n';
+-        for (std::size_t j = 0; j < groups[i].faces.size(); ++j) {
+-            Face const & face =  groups[i].faces[j];
+-            out << "f";
+-            for (std::size_t k = 0; k < 3; ++k) {
+-                out << " " << face.vertex_ids[k]  + OBJ_INDEX_OFFSET
+-                    << "/" << face.texcoord_ids[k]  + OBJ_INDEX_OFFSET
+-                    << "/" << face.normal_ids[k]  + OBJ_INDEX_OFFSET;
+-            }
+-            out << '\n';
+-        }
++        std::vector<Face> const & faces = groups[i].faces;
++        write_chunked(faces.size(), [&faces](std::size_t j, char * l, std::size_t sz) {
++            Face const & f = faces[j];
++            return std::snprintf(l, sz, "f %zu/%zu/%zu %zu/%zu/%zu %zu/%zu/%zu\n",
++                f.vertex_ids[0] + OBJ_INDEX_OFFSET, f.texcoord_ids[0] + OBJ_INDEX_OFFSET, f.normal_ids[0] + OBJ_INDEX_OFFSET,
++                f.vertex_ids[1] + OBJ_INDEX_OFFSET, f.texcoord_ids[1] + OBJ_INDEX_OFFSET, f.normal_ids[1] + OBJ_INDEX_OFFSET,
++                f.vertex_ids[2] + OBJ_INDEX_OFFSET, f.texcoord_ids[2] + OBJ_INDEX_OFFSET, f.normal_ids[2] + OBJ_INDEX_OFFSET);
++        });
+     }
+     out.close();
+ }
+diff --git a/libs/tex/rectangular_bin.cpp b/libs/tex/rectangular_bin.cpp
+index c4b8015..a0d690b 100644
+--- a/libs/tex/rectangular_bin.cpp
++++ b/libs/tex/rectangular_bin.cpp
+@@ -8,15 +8,29 @@
+  */
+ 
+ #include <cmath>
++#include <algorithm>
+ 
+ #include "rectangular_bin.h"
+ 
+ RectangularBin::RectangularBin(unsigned int width, unsigned int height)
+     : width(width), height(height) {
+     rects.push_back(Rect<int>(0, 0, width, height));
++    update_max_free();
++}
++
++void RectangularBin::update_max_free(void) {
++    max_free_w = 0;
++    max_free_h = 0;
++    for (Rect<int> const & r : rects) {
++        max_free_w = std::max(max_free_w, r.width());
++        max_free_h = std::max(max_free_h, r.height());
++    }
+ }
+ 
+ bool RectangularBin::insert(Rect<int> * rect) {
++    /* bitblade: exact fast reject - no free rect can hold it. */
++    if (rect->width() > max_free_w || rect->height() > max_free_h) return false;
++
+     /* The best score is 0 so we initialize with the worst. */
+     unsigned int best_score = width * height;
+     std::list<Rect<int> >::iterator best_rect_it = rects.end();
+@@ -63,6 +77,7 @@ bool RectangularBin::insert(Rect<int> * rect) {
+             if (hsplit_bottom.size() != 0) rects.push_back(hsplit_bottom);
+         }
+ 
++        update_max_free();
+         return true;
+     } else {
+         return false;
+diff --git a/libs/tex/rectangular_bin.h b/libs/tex/rectangular_bin.h
+index 60e8df1..46a35a9 100644
+--- a/libs/tex/rectangular_bin.h
++++ b/libs/tex/rectangular_bin.h
+@@ -30,6 +30,10 @@ class RectangularBin {
+         unsigned int width;
+         unsigned int height;
+         std::list<Rect<int> > rects;
++        /* bitblade: largest free width/height (necessary condition for a fit) */
++        int max_free_w;
++        int max_free_h;
++        void update_max_free(void);
+ 
+     public:
+         /**
+diff --git a/libs/tex/texture_atlas.cpp b/libs/tex/texture_atlas.cpp
+index 1b7a95e..97f8b77 100644
+--- a/libs/tex/texture_atlas.cpp
++++ b/libs/tex/texture_atlas.cpp
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <set>
++#include <algorithm>
+ #include <map>
+ 
+ #include <util/file_system.h>
+@@ -44,8 +45,9 @@ void copy_into(typename mve::Image<T>::ConstPtr src, int x, int y,
+     assert(x >= 0 && x + src->width() + 2 * border <= dest->width());
+     assert(y >= 0 && y + src->height() + 2 * border <= dest->height());
+ 
+-    for (int i = 0; i < src->width() + 2 * border; ++i) {
+-        for(int j = 0; j < src->height() + 2 * border; j++) {
++    /* bitblade: row-major traversal (pure copy, identical result) */
++    for(int j = 0; j < src->height() + 2 * border; j++) {
++        for (int i = 0; i < src->width() + 2 * border; ++i) {
+             int sx = i - border;
+             int sy = j - border;
+ 
+@@ -151,27 +153,30 @@ TextureAtlas::apply_edge_padding(void) {
+     gauss[6] = 1.0f; gauss[7] = 2.0f; gauss[8] = 1.0f;
+     gauss /= 16.0f;
+ 
+-    /* Calculate the set of invalid pixels at the border of texture patches. */
+-    PixelSet invalid_border_pixels;
+-    for (int y = 0; y < height; ++y) {
+-        for (int x = 0; x < width; ++x) {
++    /* bitblade: the original used std::set<std::pair<int,int>>. Within one
++     * dilation pass the computed pixels never read each other (they only read
++     * pixels that were already valid before the pass), so the processing
++     * order is irrelevant; sorted+unique vectors give the identical result
++     * much faster. */
++    PixelVector invalid_border_pixels;
++    for (int x = 0; x < width; ++x) {
++        for (int y = 0; y < height; ++y) {
+             if (validity_mask->at(x, y, 0) == 255) continue;
+ 
+-            /* Check the direct neighbourhood of all invalid pixels. */
+-            for (int j = -1; j <= 1; ++j) {
++            bool border = false;
++            for (int j = -1; j <= 1 && !border; ++j) {
+                 for (int i = -1; i <= 1; ++i) {
+                     int nx = x + i;
+                     int ny = y + j;
+-                    /* If the invalid pixel has a valid neighbour: */
+                     if (0 <= nx && nx < width &&
+                         0 <= ny && ny < height &&
+                         validity_mask->at(nx, ny, 0) == 255) {
+-
+-                        /* Add the pixel to the set of invalid border pixels. */
+-                        invalid_border_pixels.insert(std::pair<int, int>(x, y));
++                        border = true;
++                        break;
+                     }
+                 }
+             }
++            if (border) invalid_border_pixels.push_back(std::pair<int, int>(x, y));
+         }
+     }
+ 
+@@ -180,11 +185,11 @@ TextureAtlas::apply_edge_padding(void) {
+     /* Iteratively dilate border pixels until padding constants are reached. */
+     for (unsigned int n = 0; n <= padding; ++n) {
+         PixelVector new_valid_pixels;
++        new_valid_pixels.reserve(invalid_border_pixels.size());
+ 
+-        PixelSet::iterator it = invalid_border_pixels.begin();
+-        for (;it != invalid_border_pixels.end(); it++) {
+-            int x = it->first;
+-            int y = it->second;
++        for (std::pair<int, int> const & px : invalid_border_pixels) {
++            int x = px.first;
++            int y = px.second;
+ 
+             bool now_valid = false;
+             /* Calculate new pixel value. */
+@@ -214,7 +219,7 @@ TextureAtlas::apply_edge_padding(void) {
+             }
+ 
+             if (now_valid) {
+-                new_valid_pixels.push_back(*it);
++                new_valid_pixels.push_back(px);
+             }
+         }
+ 
+@@ -241,11 +246,14 @@ TextureAtlas::apply_edge_padding(void) {
+                          0 <= ny && ny < height &&
+                          new_validity_mask->at(nx, ny, 0) == 0) {
+ 
+-                         invalid_border_pixels.insert(std::pair<int, int>(nx, ny));
++                         invalid_border_pixels.push_back(std::pair<int, int>(nx, ny));
+                     }
+                 }
+             }
+         }
++        std::sort(invalid_border_pixels.begin(), invalid_border_pixels.end());
++        invalid_border_pixels.erase(std::unique(invalid_border_pixels.begin(),
++            invalid_border_pixels.end()), invalid_border_pixels.end());
+     }
+ }
+ 
+diff --git a/libs/tex/uni_graph.cpp b/libs/tex/uni_graph.cpp
+index 7247726..d9058da 100644
+--- a/libs/tex/uni_graph.cpp
++++ b/libs/tex/uni_graph.cpp
+@@ -53,3 +53,38 @@ UniGraph::get_subgraphs(std::size_t label,
+         }
+     }
+ }
++
++void
++UniGraph::get_all_subgraphs(
++    std::vector<std::vector<std::vector<std::size_t> > > * subgraphs) const {
++
++    std::vector<bool> used(adj_lists.size(), false);
++
++    for(std::size_t i = 0; i < adj_lists.size(); ++i) {
++        std::size_t const label = labels[i];
++        if (used[i] || label >= subgraphs->size()) continue;
++
++        std::vector<std::vector<std::size_t> > & out = subgraphs->at(label);
++        out.push_back(std::vector<std::size_t>());
++
++        std::list<std::size_t> queue;
++        queue.push_back(i);
++        used[i] = true;
++
++        while (!queue.empty()) {
++            std::size_t node = queue.front();
++            queue.pop_front();
++
++            out.back().push_back(node);
++
++            std::vector<std::size_t> const & adj_list = adj_lists[node];
++            for(std::size_t j = 0; j < adj_list.size(); ++j) {
++                std::size_t adj_node = adj_list[j];
++                if (labels[adj_node] == label && !used[adj_node]){
++                    queue.push_back(adj_node);
++                    used[adj_node] = true;
++                }
++            }
++        }
++    }
++}
+diff --git a/libs/tex/uni_graph.h b/libs/tex/uni_graph.h
+index 5f9a8f0..0051f1f 100644
+--- a/libs/tex/uni_graph.h
++++ b/libs/tex/uni_graph.h
+@@ -74,6 +74,11 @@ class UniGraph {
+           */
+         void get_subgraphs(std::size_t label, std::vector<std::vector<std::size_t> > * subgraphs) const;
+ 
++        /** bitblade: subgraphs of ALL labels in a single pass. Result for
++         * label l is identical (content and order) to get_subgraphs(l).
++         * Labels >= subgraphs->size() are ignored. */
++        void get_all_subgraphs(std::vector<std::vector<std::vector<std::size_t> > > * subgraphs) const;
++
+         std::vector<std::size_t> const & get_adj_nodes(std::size_t node) const;
+ };
+ 
+diff --git a/libs/tex/view_selection.cpp b/libs/tex/view_selection.cpp
+index 538b634..4916e08 100644
+--- a/libs/tex/view_selection.cpp
++++ b/libs/tex/view_selection.cpp
+@@ -7,6 +7,7 @@
+  * of the BSD 3-Clause license. See the LICENSE.txt file for details.
+  */
+ 
++#include <cstdlib>
+ #include <util/timer.h>
+ 
+ #include "util.h"
+@@ -113,6 +114,9 @@ view_selection(DataCosts const & data_costs, UniGraph * graph, Settings const &)
+     /* Set false for non-deterministic (but faster) mapMAP execution. */
+     ctr.sample_deterministic = true;
+     ctr.initial_seed = 548923723;
++    /* bitblade: optional seed override for statistical tests */
++    if (char const * seed_env = std::getenv("BB_MAPMAP_SEED"))
++        ctr.initial_seed = static_cast<unsigned int>(std::strtoul(seed_env, nullptr, 10));
+ 
+     std::cout << "\tOptimizing:\n\t\tTime[s]\tEnergy" << std::endl;
+     solver.optimize(solution, ctr);

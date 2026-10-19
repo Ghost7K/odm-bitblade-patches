@@ -1,0 +1,271 @@
+diff --git a/libs/tex/generate_texture_atlases.cpp b/libs/tex/generate_texture_atlases.cpp
+index ffa6041..4830beb 100644
+--- a/libs/tex/generate_texture_atlases.cpp
++++ b/libs/tex/generate_texture_atlases.cpp
+@@ -108,7 +108,14 @@ generate_texture_atlases(std::vector<TexturePatch::Ptr> * orig_texture_patches,
+         orig_texture_patches->pop_back();
+ 
+         if (settings.tone_mapping != TONE_MAPPING_NONE) {
+-            mve::image::gamma_correct(texture_patch->get_image(), 1.0f / 2.2f);
++            if (texture_patch->is_compact() && texture_patch->compact_gamma()) {
++                /* bitblade Patch 24: Bytes sind bereits gamma-kodiert -> nur Flag umstellen */
++                texture_patch->drop_compact_gamma();
++            } else {
++                bool const c = texture_patch->is_compact();
++                mve::image::gamma_correct(texture_patch->get_image(), 1.0f / 2.2f);
++                if (c) texture_patch->compact(false);
++            }
+         }
+ 
+         texture_patches.push_back(texture_patch);
+diff --git a/libs/tex/generate_texture_patches.cpp b/libs/tex/generate_texture_patches.cpp
+index 1b953c8..c4757e3 100644
+--- a/libs/tex/generate_texture_patches.cpp
++++ b/libs/tex/generate_texture_patches.cpp
+@@ -7,6 +7,7 @@
+  * of the BSD 3-Clause license. See the LICENSE.txt file for details.
+  */
+ 
++#include <cstdlib>
+ #include <set>
+ #include <list>
+ 
+@@ -502,6 +503,7 @@ generate_texture_patches(UniGraph const & graph, mve::TriangleMesh::ConstPtr mes
+         for (std::size_t j = 0; j < subgraphs.size(); ++j) {
+             candidates.push_back(generate_candidate(label, *texture_view, subgraphs[j], mesh, settings));
+         }
++        mve::ImageType const bb_view_type = texture_view->get_image()->get_type();
+         texture_view->release_image();
+         std::vector<std::vector<std::size_t> >().swap(subgraphs);
+ 
+@@ -531,7 +533,13 @@ generate_texture_patches(UniGraph const & graph, mve::TriangleMesh::ConstPtr mes
+             }
+         }
+ 
++        /* bitblade Patch 24: Patches aus 8-Bit-Bildern kompakt (8 Bit) halten.
++         * Abschalten: Umgebungsvariable BITBLADE_TEX_COMPACT=0 */
++        static bool const bb_compact_on = [](){ const char* e = std::getenv("BITBLADE_TEX_COMPACT"); return !(e && e[0] == '0'); }();
+         for (it = candidates.begin(); it != candidates.end(); ++it) {
++            if (bb_compact_on && bb_view_type == mve::IMAGE_TYPE_UINT8
++                && settings.tone_mapping == TONE_MAPPING_NONE) /* gamma: Klammerung verfälscht Leveling -> float behalten */
++                it->texture_patch->compact(settings.tone_mapping == TONE_MAPPING_GAMMA);
+             view_patches[i].push_back(it->texture_patch);
+         }
+     }
+diff --git a/libs/tex/local_seam_leveling.cpp b/libs/tex/local_seam_leveling.cpp
+index 3a13a1b..4aa40ae 100644
+--- a/libs/tex/local_seam_leveling.cpp
++++ b/libs/tex/local_seam_leveling.cpp
+@@ -215,6 +215,8 @@ local_seam_leveling(UniGraph const & graph, mve::TriangleMesh::ConstPtr mesh,
+     for (std::int64_t i = 0; i < texture_patches->size(); ++i) {
+ #endif
+         TexturePatch::Ptr texture_patch = texture_patches->at(i);
++        bool const bb_compact = texture_patch->is_compact();
++        bool const bb_gamma = texture_patch->compact_gamma();
+         mve::FloatImage::Ptr image = texture_patch->get_image()->duplicate();
+ 
+         /* Apply colors. */
+@@ -235,6 +237,8 @@ local_seam_leveling(UniGraph const & graph, mve::TriangleMesh::ConstPtr mesh,
+ 
+         texture_patch->blend(image);
+         texture_patch->release_blending_mask();
++        image.reset();
++        if (bb_compact) texture_patch->compact(bb_gamma);
+         texture_patch_counter.inc();
+     }
+ }
+diff --git a/libs/tex/texture_atlas.cpp b/libs/tex/texture_atlas.cpp
+index 97f8b77..cb87ebb 100644
+--- a/libs/tex/texture_atlas.cpp
++++ b/libs/tex/texture_atlas.cpp
+@@ -98,7 +98,20 @@ TextureAtlas::insert(TexturePatch::ConstPtr texture_patch) {
+     /* Update texture atlas and its validity mask. */
+ 
+ 
+-    if (image->get_type() == mve::IMAGE_TYPE_FLOAT){
++    if (texture_patch->is_compact() && !texture_patch->compact_gamma()
++        && image->get_type() == mve::IMAGE_TYPE_UINT8) {
++        /* bitblade Patch 24: 8-Bit-Patch direkt kopieren (kein float-Umweg) */
++        copy_into<uint8_t>(texture_patch->get_image8(), rect.min_x, rect.min_y, std::dynamic_pointer_cast<mve::ByteImage>(image), padding);
++    } else if (texture_patch->is_compact()) {
++        mve::FloatImage::ConstPtr fimg = texture_patch->float_view();
++        if (image->get_type() == mve::IMAGE_TYPE_FLOAT) {
++            copy_into<float>(fimg, rect.min_x, rect.min_y, std::dynamic_pointer_cast<mve::FloatImage>(image), padding);
++        } else if (image->get_type() == mve::IMAGE_TYPE_UINT16) {
++            copy_into<uint16_t>(float_to_raw_image(fimg, 0.0f, 1.0f), rect.min_x, rect.min_y, std::dynamic_pointer_cast<mve::RawImage>(image), padding);
++        } else {
++            copy_into<uint8_t>(mve::image::float_to_byte_image(fimg, 0.0f, 1.0f), rect.min_x, rect.min_y, std::dynamic_pointer_cast<mve::ByteImage>(image), padding);
++        }
++    } else if (image->get_type() == mve::IMAGE_TYPE_FLOAT){
+         copy_into<float>(texture_patch->get_image(), rect.min_x, rect.min_y, std::dynamic_pointer_cast<mve::FloatImage>(image), padding);
+     }else if (image->get_type() == mve::IMAGE_TYPE_UINT16){
+         mve::RawImage::Ptr patch_image = float_to_raw_image(
+diff --git a/libs/tex/texture_patch.cpp b/libs/tex/texture_patch.cpp
+index f98bbbb..b0c5c05 100644
+--- a/libs/tex/texture_patch.cpp
++++ b/libs/tex/texture_patch.cpp
+@@ -7,6 +7,7 @@
+  * of the BSD 3-Clause license. See the LICENSE.txt file for details.
+  */
+ 
++#include <cmath>
+ #include <set>
+ 
+ #include <math/functions.h>
+@@ -29,7 +30,9 @@ TexturePatch::TexturePatch(TexturePatch const & texture_patch) {
+     label = texture_patch.label;
+     faces = std::vector<std::size_t>(texture_patch.faces);
+     texcoords = std::vector<math::Vec2f>(texture_patch.texcoords);
+-    image = texture_patch.image->duplicate();
++    if (texture_patch.image) image = texture_patch.image->duplicate();
++    if (texture_patch.image8) image8 = texture_patch.image8->duplicate();
++    image8_gamma = texture_patch.image8_gamma;
+     validity_mask = texture_patch.validity_mask->duplicate();
+     if (texture_patch.blending_mask != NULL) {
+         blending_mask = texture_patch.blending_mask->duplicate();
+@@ -41,6 +44,9 @@ const float sqrt_2 = sqrt(2);
+ void
+ TexturePatch::adjust_colors(std::vector<math::Vec3f> const & adjust_values) {
+     assert(blending_mask != NULL);
++    bool const was_compact = is_compact();
++    bool const was_gamma = image8_gamma;
++    expand();
+ 
+     validity_mask->fill(0);
+ 
+@@ -113,6 +119,7 @@ TexturePatch::adjust_colors(std::vector<math::Vec3f> const & adjust_values) {
+             std::copy(color.begin(), color.end(), &image->at(i, 0));
+         }
+     }
++    if (was_compact) compact(was_gamma);
+ }
+ 
+ bool TexturePatch::valid_pixel(math::Vec2f pixel) const {
+@@ -164,10 +171,68 @@ TexturePatch::get_pixel_value(math::Vec2f pixel) const {
+     assert(valid_pixel(pixel));
+ 
+     math::Vec3f color;
++    if (image8) {
++        /* bitblade Patch 24: bilinear aus 8 Bit, wie linear_at */
++        int const w = image8->width(), h = image8->height();
++        float const x = std::max(0.0f, std::min(static_cast<float>(w - 1), pixel[0]));
++        float const y = std::max(0.0f, std::min(static_cast<float>(h - 1), pixel[1]));
++        int const x0 = static_cast<int>(x), y0 = static_cast<int>(y);
++        int const x1 = std::min(x0 + 1, w - 1), y1 = std::min(y0 + 1, h - 1);
++        float const wx = x - x0, wy = y - y0;
++        for (int c = 0; c < 3; ++c) {
++            float const v = (1 - wx) * (1 - wy) * image8->at(x0, y0, c) + wx * (1 - wy) * image8->at(x1, y0, c)
++                + (1 - wx) * wy * image8->at(x0, y1, c) + wx * wy * image8->at(x1, y1, c);
++            float f = v / 255.0f;
++            color[c] = image8_gamma ? std::pow(f, 2.2f) : f;
++        }
++        return color;
++    }
+     image->linear_at(pixel[0], pixel[1], *color);
+     return color;
+ }
+ 
++void
++TexturePatch::compact(bool gamma) {
++    if (image8 || !image) return;
++    int const w = image->width(), h = image->height();
++    mve::ByteImage::Ptr b = mve::ByteImage::create(w, h, 3);
++    float const * src = image->get_data_pointer();
++    uint8_t * dst = b->get_data_pointer();
++    std::size_t const n = static_cast<std::size_t>(w) * h * 3;
++    for (std::size_t i = 0; i < n; ++i) {
++        float f = std::max(0.0f, std::min(1.0f, src[i]));
++        if (gamma) f = std::pow(f, 1.0f / 2.2f);
++        dst[i] = static_cast<uint8_t>(f * 255.0f + 0.5f);
++    }
++    image8 = b;
++    image8_gamma = gamma;
++    image.reset();
++}
++
++mve::FloatImage::ConstPtr
++TexturePatch::float_view(void) const {
++    if (!image8) return image;
++    TexturePatch tmp(*this);
++    tmp.expand();
++    return tmp.image;
++}
++
++void
++TexturePatch::expand(void) {
++    if (!image8) return;
++    int const w = image8->width(), h = image8->height();
++    mve::FloatImage::Ptr f = mve::FloatImage::create(w, h, 3);
++    uint8_t const * src = image8->get_data_pointer();
++    float * dst = f->get_data_pointer();
++    std::size_t const n = static_cast<std::size_t>(w) * h * 3;
++    for (std::size_t i = 0; i < n; ++i) {
++        float v = src[i] / 255.0f;
++        dst[i] = image8_gamma ? std::pow(v, 2.2f) : v;
++    }
++    image = f;
++    image8.reset();
++}
++
+ void
+ TexturePatch::set_pixel_value(math::Vec2i pixel, math::Vec3f color) {
+     assert(blending_mask != NULL);
+diff --git a/libs/tex/texture_patch.h b/libs/tex/texture_patch.h
+index 4ea2a6c..7fa1ac3 100644
+--- a/libs/tex/texture_patch.h
++++ b/libs/tex/texture_patch.h
+@@ -37,6 +37,9 @@ class TexturePatch {
+         Faces faces;
+         Texcoords texcoords;
+         mve::FloatImage::Ptr image;
++        /* bitblade Patch 24: kompakte 8-Bit-Speicherung (statt 12 B/Pixel float) */
++        mve::ByteImage::Ptr image8;
++        bool image8_gamma = false;
+         mve::ByteImage::Ptr validity_mask;
+         mve::ByteImage::Ptr blending_mask;
+ 
+@@ -76,6 +79,18 @@ class TexturePatch {
+         std::pair<float, float> get_min_max(void) const;
+ 
+         void release_blending_mask(void);
++
++        /** bitblade Patch 24: float-Bild in 8 Bit umwandeln (gamma: Werte vorher mit 1/2.2 kodieren) */
++        void compact(bool gamma);
++        /** bitblade Patch 24: 8-Bit-Bild wieder als float bereitstellen (no-op wenn nicht kompakt) */
++        void expand(void);
++        bool is_compact(void) const { return image8 != nullptr; }
++        bool compact_gamma(void) const { return image8_gamma; }
++        /** Werte gelten ab jetzt als bereits gamma-kodiert (Atlas-Tonmapping 1/2.2 ohne Rechenaufwand). */
++        void drop_compact_gamma(void) { image8_gamma = false; }
++        mve::ByteImage::ConstPtr get_image8(void) const { return image8; }
++        /** float-Kopie (bzw. das float-Bild selbst), ohne den Patch zu verändern */
++        mve::FloatImage::ConstPtr float_view(void) const;
+         void prepare_blending_mask(std::size_t strip_width);
+ 
+         void erode_validity_mask(void);
+@@ -111,21 +126,23 @@ TexturePatch::get_label(void) const {
+ 
+ inline int
+ TexturePatch::get_width(void) const {
+-    return image->width();
++    return image8 ? image8->width() : image->width();
+ }
+ 
+ inline int
+ TexturePatch::get_height(void) const {
+-    return image->height();
++    return image8 ? image8->height() : image->height();
+ }
+ 
+ inline mve::FloatImage::Ptr
+ TexturePatch::get_image(void) {
++    expand();
+     return image;
+ }
+ 
+ inline mve::FloatImage::ConstPtr
+ TexturePatch::get_image(void) const {
++    assert(image8 == nullptr);
+     return image;
+ }
+ 

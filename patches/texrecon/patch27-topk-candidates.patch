@@ -1,0 +1,48 @@
+From 1e3e3d21d76ed7fae778cdf0afbdeef19fb300d1 Mon Sep 17 00:00:00 2001
+From: bitblade <ops@bitblade.io>
+Date: Sat, 10 Oct 2026 03:37:47 +0200
+Subject: [PATCH] patch27 topk
+
+---
+ libs/tex/calculate_data_costs.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/libs/tex/calculate_data_costs.cpp b/libs/tex/calculate_data_costs.cpp
+index 38cc44f..387a49f 100644
+--- a/libs/tex/calculate_data_costs.cpp
++++ b/libs/tex/calculate_data_costs.cpp
+@@ -353,8 +353,23 @@ postprocess_face_infos(Settings const & settings,
+             hist_qualities.add_value(info.quality);
+     float percentile = hist_qualities.get_approx_percentile(0.995f);
+ 
++    /* bitblade patch27: nur die besten K Ansichten je Flaeche behalten (BITBLADE_TEX_TOPK, 0 = alle).
++     * Normierung (Perzentil) bleibt auf allen Kandidaten -> gleiche Kostenskala. */
++    std::size_t bb_topk = 0;
++    if (char const * e = std::getenv("BITBLADE_TEX_TOPK")) bb_topk = std::strtoul(e, nullptr, 10);
++    std::size_t bb_before = 0, bb_after = 0;
+     /* Calculate the costs. */
+     for (std::uint32_t i = 0; i < face_projection_infos->size(); ++i) {
++        std::vector<FaceProjectionInfoC> & bb_inf = face_projection_infos->at(i);
++        bb_before += bb_inf.size();
++        if (bb_topk > 0 && bb_inf.size() > bb_topk) {
++            std::nth_element(bb_inf.begin(), bb_inf.begin() + bb_topk, bb_inf.end(),
++                [](FaceProjectionInfoC const & a, FaceProjectionInfoC const & b) {
++                    return a.quality > b.quality || (a.quality == b.quality && a.view_id < b.view_id); });
++            bb_inf.resize(bb_topk);
++            std::sort(bb_inf.begin(), bb_inf.end());
++        }
++        bb_after += bb_inf.size();
+         for (FaceProjectionInfoC const & info : face_projection_infos->at(i)) {
+ 
+             /* Clamp to percentile and normalize. */
+@@ -368,6 +383,7 @@ postprocess_face_infos(Settings const & settings,
+     }
+ 
+     std::cout << "\tMaximum quality of a face within an image: " << max_quality << std::endl;
++    std::cout << "\tbitblade: Kandidaten " << bb_before << " -> " << bb_after << " (TOPK=" << bb_topk << ")" << std::endl;
+     std::cout << "\tClamping qualities to " << percentile << " within normalization." << std::endl;
+ }
+ 
+-- 
+2.43.0
+

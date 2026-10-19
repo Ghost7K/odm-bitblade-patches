@@ -1,0 +1,111 @@
+diff --git a/apps/texrecon/texrecon.cpp b/apps/texrecon/texrecon.cpp
+index eb28c5f..156a6fb 100644
+--- a/apps/texrecon/texrecon.cpp
++++ b/apps/texrecon/texrecon.cpp
+@@ -26,6 +26,19 @@
+ 
+ #include "arguments.h"
+ 
++
++#include <fstream>
++/* bitblade Patch 23: Speicherprotokoll je Phase (VmRSS/VmHWM aus /proc/self/status) */
++static void bb_mem(const char* phase) {
++    std::ifstream f("/proc/self/status"); std::string line, rss="?", hwm="?";
++    while (std::getline(f, line)) {
++        if (line.rfind("VmRSS:",0)==0) rss=line.substr(6);
++        if (line.rfind("VmHWM:",0)==0) hwm=line.substr(6);
++    }
++    auto trim=[](std::string x){ x.erase(0,x.find_first_not_of(" \t")); return x; };
++    std::cout << "[bitblade-mem] " << phase << " RSS=" << trim(rss) << " Spitze=" << trim(hwm) << std::endl;
++}
++
+ int main(int argc, char **argv) {
+     util::system::print_build_timestamp(argv[0]);
+     util::system::register_segfault_handler();
+@@ -79,7 +92,7 @@ int main(int argc, char **argv) {
+     mve::ImageType type = tex::generate_texture_views(conf.in_scene, &texture_views, tmp_dir);
+ 
+     write_string_to_file(conf.out_prefix + ".conf", conf.to_string());
+-    timer.measure("Loading");
++    timer.measure("Loading"); bb_mem("Loading");
+ 
+     std::size_t const num_faces = mesh->get_faces().size() / 3;
+ 
+@@ -111,7 +124,7 @@ int main(int argc, char **argv) {
+             }
+             std::cout << "done." << std::endl;
+         }
+-        timer.measure("Calculating data costs");
++        timer.measure("Calculating data costs"); bb_mem("Calculating data costs");
+ 
+         try {
+             tex::view_selection(data_costs, &graph, conf.settings);
+@@ -119,7 +132,7 @@ int main(int argc, char **argv) {
+             std::cerr << "\tOptimization failed: " << e.what() << std::endl;
+             std::exit(EXIT_FAILURE);
+         }
+-        timer.measure("Running MRF optimization");
++        timer.measure("Running MRF optimization"); bb_mem("Running MRF optimization");
+         std::cout << "\tTook: " << rwtimer.get_elapsed_sec() << "s" << std::endl;
+ 
+         /* Write labeling to file. */
+@@ -161,11 +174,14 @@ int main(int argc, char **argv) {
+         std::cout << "Generating texture patches:" << std::endl;
+         tex::generate_texture_patches(graph, mesh, mesh_info, &texture_views,
+             conf.settings, &vertex_projection_infos, &texture_patches);
++        { std::size_t px=0; for (auto const & tp : texture_patches) px += (std::size_t)tp->get_width()*tp->get_height();
++          std::cout << "[bitblade-mem] Patches=" << texture_patches.size() << " Pixel=" << px << " (float " << px*14/1048576 << " MiB)" << std::endl; }
++        bb_mem("Texture-Patches erzeugt");
+ 
+         if (conf.settings.global_seam_leveling) {
+             std::cout << "Running global seam leveling:" << std::endl;
+             tex::global_seam_leveling(graph, mesh, mesh_info, vertex_projection_infos, &texture_patches);
+-            timer.measure("Running global seam leveling");
++            timer.measure("Running global seam leveling"); bb_mem("Running global seam leveling");
+         } else {
+             ProgressCounter texture_patch_counter("Calculating validity masks for texture patches", texture_patches.size());
+             #pragma omp parallel for schedule(dynamic)
+@@ -180,20 +196,21 @@ int main(int argc, char **argv) {
+                 texture_patch->adjust_colors(patch_adjust_values);
+                 texture_patch_counter.inc();
+             }
+-            timer.measure("Calculating texture patch validity masks");
++            timer.measure("Calculating texture patch validity masks"); bb_mem("Calculating texture patch validity masks");
+         }
+ 
+         if (conf.settings.local_seam_leveling) {
+             std::cout << "Running local seam leveling:" << std::endl;
+             tex::local_seam_leveling(graph, mesh, vertex_projection_infos, &texture_patches);
+         }
+-        timer.measure("Running local seam leveling");
++        timer.measure("Running local seam leveling"); bb_mem("Running local seam leveling");
+ 
+         /* Generate texture atlases. */
+         std::cout << "Generating texture atlases:" << std::endl;
+ 
+         bool grayscale = texture_views.front().is_grayscale();
+         tex::generate_texture_atlases(&texture_patches, conf.settings, &texture_atlases, type, grayscale);
++        std::cout << "[bitblade-mem] Atlanten=" << texture_atlases.size() << std::endl; bb_mem("Atlanten erzeugt");
+     }
+ 
+     /* Create and write out obj model. */
+@@ -201,16 +218,16 @@ int main(int argc, char **argv) {
+         std::cout << "Building objmodel:" << std::endl;
+         tex::Model model;
+         tex::build_model(mesh, texture_atlases, &model);
+-        timer.measure("Building OBJ model");
++        timer.measure("Building OBJ model"); bb_mem("Building OBJ model");
+ 
+         std::cout << "\tSaving model... " << std::flush;
+         tex::Model::save(model, conf.out_prefix);
+         std::cout << "done." << std::endl;
+-        timer.measure("Saving");
++        timer.measure("Saving"); bb_mem("Saving");
+     }
+ 
+     std::cout << "Whole texturing procedure took: " << wtimer.get_elapsed_sec() << "s" << std::endl;
+-    timer.measure("Total");
++    timer.measure("Total"); bb_mem("Total");
+     if (conf.write_timings) {
+         timer.write_to_file(conf.out_prefix + "_timings.csv");
+     }

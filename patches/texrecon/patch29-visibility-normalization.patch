@@ -1,0 +1,63 @@
+From 795922b8b69028c6038328979262eeff7744d08e Mon Sep 17 00:00:00 2001
+From: bitblade <ops@bitblade.io>
+Date: Sat, 10 Oct 2026 04:44:22 +0200
+Subject: [PATCH] patch29 visibility fix
+
+---
+ libs/tex/calculate_data_costs.cpp | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/libs/tex/calculate_data_costs.cpp b/libs/tex/calculate_data_costs.cpp
+index 387a49f..882ad44 100644
+--- a/libs/tex/calculate_data_costs.cpp
++++ b/libs/tex/calculate_data_costs.cpp
+@@ -16,10 +16,14 @@
+ 
+ #include "util.h"
+ #include <cstdlib>
++#include <string>
+ /* bitblade-fallback */
+ static const bool bb_fallback = std::getenv("BITBLADE_TEX_FALLBACK") != nullptr;
+ static bool bb_pass2 = false;
+ static std::vector<char> const * bb_only_faces = nullptr;
++/* bitblade patch29 */
++static const bool bb_visfix = !(std::getenv("BITBLADE_TEX_VISFIX") && std::string(std::getenv("BITBLADE_TEX_VISFIX")) == "0");
++static const float bb_vis_eps = std::getenv("BITBLADE_TEX_VIS_EPS") ? std::strtof(std::getenv("BITBLADE_TEX_VIS_EPS"), nullptr) : 1.0f;
+ #include "histogram.h"
+ #include "texturing.h"
+ #include "sparse_table.h"
+@@ -236,13 +240,17 @@ calculate_face_projection_infos(mve::TriangleMesh::ConstPtr mesh,
+                    
+                     math::Vec3f const * samples[] = {&v1, &v2, &v3};
+                     // TODO: random monte carlo samples...
++                    /* bitblade patch29: robuster Sichtbarkeitstest fuer feine Meshes –
++                     * Strahlstart 10 % zur Flaechenmitte gezogen, tmin mind. eine Kantenlaenge. */
++                    float bb_edge = 0.0f;
++                    if (bb_visfix) bb_edge = bb_vis_eps * std::max((v1 - v2).norm(), std::max((v2 - v3).norm(), (v3 - v1).norm()));
+ 
+                     for (std::size_t k = 0; k < sizeof(samples) / sizeof(samples[0]); ++k) {
+                         BVHTree::Ray ray;
+-                        ray.origin = *samples[k];
++                        ray.origin = bb_visfix ? (*samples[k] + (face_center - *samples[k]) * 0.1f) : *samples[k];
+                         ray.dir = view_pos - ray.origin;
+                         ray.tmax = ray.dir.norm();
+-                        ray.tmin = ray.tmax * 0.0001f;
++                        ray.tmin = std::max(ray.tmax * 0.0001f, bb_edge);
+                         ray.dir.normalize();
+ 
+                         BVHTree::Hit hit;
+@@ -352,6 +360,11 @@ postprocess_face_infos(Settings const & settings,
+         for (FaceProjectionInfoC const & info : face_projection_infos->at(i))
+             hist_qualities.add_value(info.quality);
+     float percentile = hist_qualities.get_approx_percentile(0.995f);
++    /* bitblade patch29: Perzentil 0 wuerde alle Kosten auf 0 setzen (Qualitaet wird ignoriert) */
++    if (bb_visfix && !(percentile > 0.0f)) {
++        std::cout << "\tbitblade: Perzentil " << percentile << " -> Maximalqualitaet " << max_quality << std::endl;
++        percentile = max_quality > 0.0f ? max_quality : 1.0f;
++    }
+ 
+     /* bitblade patch27: nur die besten K Ansichten je Flaeche behalten (BITBLADE_TEX_TOPK, 0 = alle).
+      * Normierung (Perzentil) bleibt auf allen Kandidaten -> gleiche Kostenskala. */
+-- 
+2.43.0
+

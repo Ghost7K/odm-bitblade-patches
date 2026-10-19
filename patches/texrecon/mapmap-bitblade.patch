@@ -1,0 +1,261 @@
+diff --git a/mapmap/source/graph.impl.h b/mapmap/source/graph.impl.h
+index 42502d3..13ec553 100755
+--- a/mapmap/source/graph.impl.h
++++ b/mapmap/source/graph.impl.h
+@@ -292,40 +292,25 @@ update_components()
+                 }
+             });
+ 
+-        /* Collect all ids represantating the components */
+-        tbb::parallel_for(node_range, 
+-            [&] (const tbb::blocked_range<uint32_t>& range)
+-            {
+-                for (auto i = range.begin(); i != range.end(); ++i)
+-                {
+-                    comp_id_set.insert(comp_set.find(i));
+-                }
+-            });
+-
+-        /* Sorting the representative ids into an array to map them to a contiguous
+-         * index via binary search */
+-        std::vector<uint32_t> comp_id_list(comp_id_set.begin(), comp_id_set.end());
+-
+-        std::sort(comp_id_list.begin(), comp_id_list.end());
+-
+-        /* Store the contiguous components ids for each node into m_components */
+-        tbb::parallel_for(node_range, 
+-            [&] (const tbb::blocked_range<uint32_t>& range)
+-            {
+-                for (auto i = range.begin(); i != range.end(); ++i)
+-                {
+-                    auto old_component_id = comp_set.find(i);
+-                    uint32_t new_component_id = std::lower_bound(comp_id_list.begin(),
+-                            comp_id_list.end(), old_component_id) - comp_id_list.begin();
+-                    /* If this fails, something went very wrong in the previous
+-                       parallel code.
+-
+-                    assert(comp_id_list[new_component_id] == old_component_id); */
+-                    m_components[i] = (luint_t) new_component_id;
+-                }
+-            });
++        /**
++         * bitblade: number components by their smallest node ID (serial scan
++         * in node order). The original numbering sorted the DSU
++         * representatives, which depend on the order of the concurrent
++         * unite() calls (union by rank) and hence varied between runs.
++         */
++        std::vector<uint32_t> rep_to_id(m_nodes.size(), UINT32_MAX);
++        uint32_t num_comps = 0;
++        for (uint32_t i = 0; i < (uint32_t) m_nodes.size(); ++i)
++        {
++            const uint32_t rep = comp_set.find(i);
++            if (rep_to_id[rep] == UINT32_MAX)
++                rep_to_id[rep] = num_comps++;
++            m_components[i] = (luint_t) rep_to_id[rep];
++        }
++        (void) node_range;
++        (void) comp_id_set;
+ 
+-        m_num_components = comp_id_list.size();
++        m_num_components = num_comps;
+     }
+     else 
+     {
+diff --git a/mapmap/source/multilevel.impl.h b/mapmap/source/multilevel.impl.h
+index dfb4115..814b199 100755
+--- a/mapmap/source/multilevel.impl.h
++++ b/mapmap/source/multilevel.impl.h
+@@ -13,6 +13,11 @@
+ #include <map>
+ #include <set>
+ #include <iostream>
++#include <algorithm>
++#include <string>
++#include <cstdlib>
++#include <numeric>
++#include <random>
+ 
+ #include <oneapi/tbb/parallel_for.h>
+ #include <oneapi/tbb/blocked_range.h>
+@@ -386,10 +391,24 @@ compute_level_graph_from_node_groups()
+         new Graph<COSTTYPE>(m_num_supernodes)));
+ 
+     /**
+-     * find superedges and add them to the current graph - similarly, record
+-     * all original edges (for node-dependent pairwise costs) associated with
+-     * these superedges
++     * bitblade: superedges are computed per supernode in parallel into local
++     * buffers and then appended serially in supernode order. The original
++     * code appended under a mutex in arbitrary thread order and called
++     * reserve(size()+k) for every supernode (one full reallocation+copy per
++     * supernode, i.e. quadratic and serialized). The per-supernode content is
++     * computed exactly as before; only the global edge order is now fixed
++     * (ascending supernode ID), which makes the multilevel graph - and thus
++     * the optimization - deterministic.
+      */
++    struct LocalSuperedges
++    {
++        std::vector<luint_t> targets;  /* other supernode, ascending */
++        std::vector<COSTTYPE> weights; /* summed weights per superedge */
++        std::vector<luint_t> sizes;    /* #original edges per superedge */
++        std::vector<luint_t> list;     /* original edge IDs, grouped */
++        bool c_costs;
++    };
++    std::vector<LocalSuperedges> local(m_num_supernodes);
+ 
+     tbb::blocked_range<luint_t> supernode_range(0, m_num_supernodes);
+     tbb::parallel_for(supernode_range,
+@@ -491,49 +510,79 @@ compute_level_graph_from_node_groups()
+                     }
+                 }
+ 
+-                /**
+-                 * Having computed an indexed list for this supernode,
+-                 * add these superedges and the list to the current graph
+-                 * (serially).
+-                 */
++                /* store results for this supernode (map order = ascending) */
++                LocalSuperedges& out = local[s_n];
++                out.c_costs = c_costs;
++                out.targets.reserve(num_superedges);
++                out.weights.reserve(num_superedges);
++                out.sizes.reserve(num_superedges);
++                for(const auto& e : sedge_ids)
+                 {
+-                    std::lock_guard<std::mutex> lock(m_graph_write_mutex);
+-
+-                    /* enlarge storage for edge table */
+-                    m_superedge_sizes.reserve(m_superedge_sizes.size() +
+-                        sedge_ids.size());
+-                    m_superedge_list.reserve(m_superedge_list.size() +
+-                        total);
+-
+-                    for(const auto& e : sedge_ids)
+-                    {
+-                        /**
+-                         * to preserve validity of pairwise costs in the
+-                         * optimization, use different weights:
+-                         * - different types: costs are summed up, hence adding
+-                         *                    up weights too would return wrong
+-                         *                    results, just set weight to 1
+-                         * - common type: sum up weights and copy costs
+-                         */
+-
+-                        /* add edge to graph */
+-                        m_storage_graph.back()->add_edge(s_n, e.first, c_costs ?
+-                            sedge_weights[e.first] : 1.0);
+-
+-                        /* record number of covered original edges */
+-                        m_superedge_sizes.push_back(sedge_sizes[e.first]);
+-
+-                        /* append edges to list of original edges */
+-                        for(luint_t i = 0; i < sedge_sizes[e.first]; ++i)
+-                        {
+-                            m_superedge_list.push_back(
+-                                loc_list[loc_offsets[sedge_ids[e.first]] + i]);
+-                        }
+-                    }
++                    out.targets.push_back(e.first);
++                    out.weights.push_back(sedge_weights[e.first]);
++                    out.sizes.push_back(sedge_sizes[e.first]);
+                 }
++                out.list.swap(loc_list);
+             }
+         });
+ 
++    /* serial assembly in supernode order (linear, pre-sized) */
++    {
++        luint_t num_sedges = 0, num_list = 0;
++        for(luint_t s_n = 0; s_n < m_num_supernodes; ++s_n)
++        {
++            num_sedges += local[s_n].targets.size();
++            num_list += local[s_n].list.size();
++        }
++        m_superedge_sizes.reserve(m_superedge_sizes.size() + num_sedges);
++        m_superedge_list.reserve(m_superedge_list.size() + num_list);
++
++        /**
++         * Edge-ID order: the original assigned IDs in (random) thread order.
++         * Ascending supernode order gives sorted incidence lists, which may
++         * bias the tree sampler. Optionally use a fixed pseudo-random
++         * permutation (deterministic, but unbiased like the original).
++         */
++        std::vector<luint_t> sn_order(m_num_supernodes);
++        std::iota(sn_order.begin(), sn_order.end(), 0);
++        {
++            const char * eo = std::getenv("BB_MAPMAP_EDGE_ORDER");
++            if(eo == nullptr || std::string(eo) != "sorted")
++            {
++                std::mt19937 g(1234567u + (unsigned) m_level);
++                std::shuffle(sn_order.begin(), sn_order.end(), g);
++            }
++        }
++
++        for(const luint_t s_n : sn_order)
++        {
++            LocalSuperedges& l = local[s_n];
++            luint_t pos = 0;
++            for(luint_t k = 0; k < l.targets.size(); ++k)
++            {
++                /**
++                 * to preserve validity of pairwise costs in the
++                 * optimization, use different weights:
++                 * - different types: costs are summed up, hence adding
++                 *                    up weights too would return wrong
++                 *                    results, just set weight to 1
++                 * - common type: sum up weights and copy costs
++                 */
++                m_storage_graph.back()->add_edge(s_n, l.targets[k],
++                    l.c_costs ? l.weights[k] : 1.0);
++                m_superedge_sizes.push_back(l.sizes[k]);
++                m_superedge_list.insert(m_superedge_list.end(),
++                    l.list.begin() + pos, l.list.begin() + pos + l.sizes[k]);
++                pos += l.sizes[k];
++            }
++            /* free memory early */
++            std::vector<luint_t>().swap(l.targets);
++            std::vector<COSTTYPE>().swap(l.weights);
++            std::vector<luint_t>().swap(l.sizes);
++            std::vector<luint_t>().swap(l.list);
++        }
++    }
++
+     /* compute global offsets for edge table */
+     tbb::blocked_range<luint_t> superedge_range(0,
+         m_storage_graph.back()->edges().size());
+@@ -571,7 +620,10 @@ compute_level_label_set()
+ 
+     /* determine a set of feasible labels per supernode */
+     tbb::blocked_range<luint_t> supernode_range(0, m_num_supernodes);
+-    luint_t num_empty_label_sets = 0;
++    std::atomic<luint_t> num_empty_label_sets(0);
++    /* bitblade: collect label sets in parallel, insert serially in node order */
++    std::vector<std::vector<_iv_st<COSTTYPE, SIMDWIDTH>>> lsets(
++        m_num_supernodes);
+     tbb::parallel_for(supernode_range,
+         [&](const tbb::blocked_range<luint_t>& r)
+         {
+@@ -624,16 +676,16 @@ compute_level_label_set()
+                 if(lset.empty())
+                     num_empty_label_sets++;
+ 
+-                /* create label set from incidence vector - serial access */
+-                {
+-                    std::lock_guard<std::mutex> lock(m_graph_write_mutex);
+-
+-                    m_storage_label_set.back()->set_label_set_for_node(
+-                        s_n, lset);
+-                }
++                lsets[s_n].swap(lset);
+             }
+         });
+ 
++    for(luint_t s_n = 0; s_n < m_num_supernodes; ++s_n)
++    {
++        m_storage_label_set.back()->set_label_set_for_node(s_n, lsets[s_n]);
++        std::vector<_iv_st<COSTTYPE, SIMDWIDTH>>().swap(lsets[s_n]);
++    }
++
+     if(num_empty_label_sets > 0)
+         throw std::domain_error("Empty label set for at least one supernode!");
+ 

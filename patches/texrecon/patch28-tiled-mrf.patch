@@ -1,0 +1,274 @@
+From 686e425e310c9da93ba06b0a341a3931b594bd06 Mon Sep 17 00:00:00 2001
+From: bitblade <ops@bitblade.io>
+Date: Sat, 10 Oct 2026 04:18:39 +0200
+Subject: [PATCH] patch28 tiled MRF
+
+---
+ apps/texrecon/texrecon.cpp  |  11 +-
+ libs/tex/texturing.h        |   5 +
+ libs/tex/view_selection.cpp | 201 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 216 insertions(+), 1 deletion(-)
+
+diff --git a/apps/texrecon/texrecon.cpp b/apps/texrecon/texrecon.cpp
+index e22a207..48a4316 100644
+--- a/apps/texrecon/texrecon.cpp
++++ b/apps/texrecon/texrecon.cpp
+@@ -133,7 +133,16 @@ int main(int argc, char **argv) {
+         timer.measure("Calculating data costs"); bb_mem("Calculating data costs");
+ 
+         try {
+-            tex::view_selection(data_costs, &graph, conf.settings);
++            std::vector<math::Vec3f> bb_centers;
++            if (std::getenv("BITBLADE_TEX_MRF_TILES")) {
++                std::vector<unsigned int> const & F = mesh->get_faces();
++                std::vector<math::Vec3f> const & V = mesh->get_vertices();
++                bb_centers.resize(F.size() / 3);
++                for (std::size_t f = 0; f < bb_centers.size(); ++f)
++                    bb_centers[f] = (V[F[3*f]] + V[F[3*f+1]] + V[F[3*f+2]]) / 3.0f;
++            }
++            if (!tex::bb_view_selection_tiled(data_costs, &graph, bb_centers))
++                tex::view_selection(data_costs, &graph, conf.settings);
+         } catch (std::runtime_error& e) {
+             std::cerr << "\tOptimization failed: " << e.what() << std::endl;
+             std::exit(EXIT_FAILURE);
+diff --git a/libs/tex/texturing.h b/libs/tex/texturing.h
+index f7cf264..39c0c30 100644
+--- a/libs/tex/texturing.h
++++ b/libs/tex/texturing.h
+@@ -87,6 +87,11 @@ postprocess_face_infos(Settings const & settings,
+ void
+ view_selection(DataCosts const & data_costs, UniGraph * graph, Settings const & settings);
+ 
++/* bitblade patch28 */
++bool bb_view_selection_tiled(DataCosts const & data_costs, UniGraph * graph,
++    std::vector<math::Vec3f> const & face_centers);
++double bb_labeling_energy(DataCosts const & data_costs, UniGraph const & graph);
++
+ /**
+   * Generates texture patches using the graph to determine adjacent faces with the same label.
+   */
+diff --git a/libs/tex/view_selection.cpp b/libs/tex/view_selection.cpp
+index 0851d02..68c365f 100644
+--- a/libs/tex/view_selection.cpp
++++ b/libs/tex/view_selection.cpp
+@@ -8,11 +8,18 @@
+  */
+ 
+ #include <cstdlib>
++#include <thread>
++#include <atomic>
++#include <mutex>
++#include <numeric>
++#include <algorithm>
+ #include <util/timer.h>
+ 
+ #include "util.h"
+ #include "texturing.h"
+ #include "mapmap/full.h"
++#include <unordered_map>
++#include <cmath>
+ 
+ TEX_NAMESPACE_BEGIN
+ 
+@@ -127,4 +134,198 @@ view_selection(DataCosts const & data_costs, UniGraph * graph, Settings const &)
+     std::cout << '\t' << undefined << " faces have not been seen" << std::endl;
+ }
+ 
++/* ===================== bitblade patch28: gekachelte MRF ===================== */
++/* Loest die Ansichtsauswahl in raeumlichen Kacheln (mit Ueberlappungsrand) parallel
++ * und glaettet anschliessend die Kachelgrenzen mit ICM. Aktiv mit
++ * BITBLADE_TEX_MRF_TILES=N (N>1); Rand: BITBLADE_TEX_MRF_HALO (Default 16 Ringe). */
++
++namespace {
++double bb_energy(DataCosts const & dc, UniGraph const & g, std::vector<std::uint32_t> const & lab) {
++    double e = 0.0;
++    for (std::size_t i = 0; i < g.num_nodes(); ++i) {
++        auto const & col = dc.col(i);
++        if (col.empty()) { e += 1.0; continue; }
++        float c = 1.0f;
++        for (auto const & p : col) if (std::uint32_t(p.first) + 1 == lab[i]) { c = p.second; break; }
++        e += c;
++        for (std::size_t a : g.get_adj_nodes(i))
++            if (a > i && !dc.col(a).empty() && lab[a] != lab[i]) e += 1.0;
++    }
++    return e;
++}
++
++void bb_solve_local(DataCosts const & data_costs, UniGraph const & graph,
++        std::vector<std::uint32_t> const & nodes, std::vector<std::uint32_t> * out_labels) {
++    using uint_t = unsigned int;
++    using cost_t = float;
++    constexpr uint_t simd_w = mapmap::sys_max_simd_width<cost_t>();
++    using unary_t = mapmap::UnaryTable<cost_t, simd_w>;
++    using pairwise_t = mapmap::PairwisePotts<cost_t, simd_w>;
++
++    std::size_t const n = nodes.size();
++    std::unordered_map<std::uint32_t, std::uint32_t> loc; loc.reserve(n * 2);
++    for (std::size_t k = 0; k < n; ++k) loc[nodes[k]] = (std::uint32_t)k;
++
++    mapmap::Graph<cost_t> mgraph(n);
++    for (std::size_t k = 0; k < n; ++k) {
++        std::uint32_t i = nodes[k];
++        if (data_costs.col(i).empty()) continue;
++        for (std::size_t a : graph.get_adj_nodes(i)) {
++            if (a <= i || data_costs.col(a).empty()) continue;
++            auto it = loc.find((std::uint32_t)a);
++            if (it == loc.end()) continue;
++            mgraph.add_edge(k, it->second, 1.0f);
++        }
++    }
++    mgraph.update_components();
++
++    mapmap::LabelSet<cost_t, simd_w> label_set(n, false);
++    std::vector<unary_t> unaries; unaries.reserve(n);
++    pairwise_t pairwise(1.0f);
++    for (std::size_t k = 0; k < n; ++k) {
++        auto const & col = data_costs.col(nodes[k]);
++        std::vector<mapmap::_iv_st<cost_t, simd_w> > labels;
++        std::vector<mapmap::_s_t<cost_t, simd_w> > costs;
++        if (col.empty()) { labels.push_back(0); costs.push_back(1.0f); }
++        else {
++            labels.resize(col.size()); costs.resize(col.size());
++            for (std::size_t j = 0; j < col.size(); ++j) { labels[j] = col[j].first + 1; costs[j] = col[j].second; }
++        }
++        label_set.set_label_set_for_node(k, labels);
++        unaries.emplace_back(k, &label_set);
++        unaries.back().set_costs(costs);
++    }
++    mapmap::StopWhenReturnsDiminish<cost_t, simd_w> terminate(5, 0.01);
++    std::vector<mapmap::_iv_st<cost_t, simd_w> > solution;
++    mapmap::mapMAP<cost_t, simd_w> solver;
++    solver.set_graph(&mgraph);
++    solver.set_label_set(&label_set);
++    for (std::size_t k = 0; k < n; ++k) solver.set_unary(k, &unaries[k]);
++    solver.set_pairwise(&pairwise);
++    solver.set_termination_criterion(&terminate);
++    mapmap::mapMAP_control ctr;
++    ctr.use_multilevel = true;
++    ctr.use_spanning_tree = true;
++    ctr.use_acyclic = true;
++    ctr.spanning_tree_multilevel_after_n_iterations = 5;
++    ctr.force_acyclic = true;
++    ctr.min_acyclic_iterations = 5;
++    ctr.relax_acyclic_maximal = true;
++    ctr.tree_algorithm = mapmap::LOCK_FREE_TREE_SAMPLER;
++    ctr.sample_deterministic = true;
++    ctr.initial_seed = 548923723;
++    solver.optimize(solution, ctr);
++    out_labels->resize(n);
++    for (std::size_t k = 0; k < n; ++k) {
++        int label = label_set.label_from_offset(k, solution[k]);
++        (*out_labels)[k] = label < 0 ? 0u : (std::uint32_t)label;
++    }
++}
++} // namespace
++
++bool
++bb_view_selection_tiled(DataCosts const & data_costs, UniGraph * graph,
++        std::vector<math::Vec3f> const & centers) {
++    char const * e = std::getenv("BITBLADE_TEX_MRF_TILES");
++    std::size_t tiles = e ? std::strtoul(e, nullptr, 10) : 0;
++    if (tiles < 2) return false;
++    std::size_t halo = 16;
++    if (char const * h = std::getenv("BITBLADE_TEX_MRF_HALO")) halo = std::strtoul(h, nullptr, 10);
++    std::size_t const N = graph->num_nodes();
++    util::WallTimer timer;
++
++    /* Kacheln: Streifen in x, darin Zellen in y, gleiche Flaechenanzahl */
++    std::size_t sx = std::max<std::size_t>(1, (std::size_t)std::round(std::sqrt((double)tiles)));
++    std::size_t sy = (tiles + sx - 1) / sx;
++    std::vector<std::uint32_t> order(N); std::iota(order.begin(), order.end(), 0u);
++    std::sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b){ return centers[a][0] < centers[b][0]; });
++    std::vector<std::uint32_t> tile_of(N, 0);
++    std::vector<std::vector<std::uint32_t> > core(sx * sy);
++    for (std::size_t s = 0; s < sx; ++s) {
++        std::size_t b = N * s / sx, en = N * (s + 1) / sx;
++        std::sort(order.begin() + b, order.begin() + en, [&](std::uint32_t a, std::uint32_t c){ return centers[a][1] < centers[c][1]; });
++        for (std::size_t t = 0; t < sy; ++t) {
++            std::size_t tb = b + (en - b) * t / sy, te = b + (en - b) * (t + 1) / sy;
++            for (std::size_t q = tb; q < te; ++q) { tile_of[order[q]] = (std::uint32_t)(s * sy + t); core[s * sy + t].push_back(order[q]); }
++        }
++    }
++    std::vector<std::uint32_t>().swap(order);
++    std::cout << "\tbitblade: gekachelte MRF, " << core.size() << " Kacheln, Rand " << halo << " Ringe" << std::endl;
++
++    std::vector<std::uint32_t> label(N, 0);
++    std::atomic<std::size_t> next(0);
++    std::size_t workers = std::min<std::size_t>(core.size(), std::max(1u, std::thread::hardware_concurrency()));
++    if (char const * w = std::getenv("BITBLADE_TEX_MRF_WORKERS")) workers = std::max<std::size_t>(1, std::strtoul(w, nullptr, 10));
++    std::mutex io;
++    auto work = [&]() {
++        std::vector<char> mark(N, 0);
++        for (;;) {
++            std::size_t t = next.fetch_add(1);
++            if (t >= core.size()) break;
++            std::vector<std::uint32_t> nodes = core[t], frontier = core[t];
++            for (std::uint32_t v : nodes) mark[v] = 1;
++            for (std::size_t r = 0; r < halo && !frontier.empty(); ++r) {
++                std::vector<std::uint32_t> nf;
++                for (std::uint32_t v : frontier)
++                    for (std::size_t a : graph->get_adj_nodes(v))
++                        if (!mark[a]) { mark[a] = 1; nf.push_back((std::uint32_t)a); nodes.push_back((std::uint32_t)a); }
++                frontier.swap(nf);
++            }
++            std::vector<std::uint32_t> lab;
++            bb_solve_local(data_costs, *graph, nodes, &lab);
++            for (std::size_t k = 0; k < nodes.size(); ++k) {
++                if (tile_of[nodes[k]] == t) label[nodes[k]] = lab[k];
++                mark[nodes[k]] = 0;
++            }
++            std::lock_guard<std::mutex> lk(io);
++            std::cout << "\t\tKachel " << t << ": " << core[t].size() << " Flaechen (+" << nodes.size() - core[t].size() << " Rand)" << std::endl;
++        }
++    };
++    std::vector<std::thread> th;
++    for (std::size_t w = 0; w < workers; ++w) th.emplace_back(work);
++    for (auto & x : th) x.join();
++    std::cout << "\tbitblade: Kacheln geloest in " << timer.get_elapsed_sec() << " s, Energie " << (long long)bb_energy(data_costs, *graph, label) << std::endl;
++
++    /* ICM an den Kachelgrenzen: Flaechen mit Nachbar in anderer Kachel + 2 Ringe */
++    std::vector<char> band(N, 0); std::vector<std::uint32_t> bandv;
++    for (std::size_t i = 0; i < N; ++i)
++        for (std::size_t a : graph->get_adj_nodes(i)) if (tile_of[a] != tile_of[i]) { band[i] = 1; bandv.push_back((std::uint32_t)i); break; }
++    for (int r = 0; r < 2; ++r) {
++        std::size_t m = bandv.size();
++        for (std::size_t q = 0; q < m; ++q) for (std::size_t a : graph->get_adj_nodes(bandv[q])) if (!band[a]) { band[a] = 1; bandv.push_back((std::uint32_t)a); }
++    }
++    std::size_t changed_total = 0;
++    for (int sweep = 0; sweep < 10; ++sweep) {
++        std::size_t changed = 0;
++        for (std::uint32_t i : bandv) {
++            auto const & col = data_costs.col(i);
++            if (col.empty()) continue;
++            float best = 1e30f; std::uint32_t bl = label[i];
++            for (auto const & p : col) {
++                std::uint32_t l = std::uint32_t(p.first) + 1;
++                float c = p.second;
++                for (std::size_t a : graph->get_adj_nodes(i)) if (!data_costs.col(a).empty() && label[a] != l) c += 1.0f;
++                if (c < best - 1e-6f || (std::fabs(c - best) <= 1e-6f && l == label[i])) { best = c; bl = l; }
++            }
++            if (bl != label[i]) { label[i] = bl; ++changed; }
++        }
++        changed_total += changed;
++        if (changed == 0) break;
++    }
++    std::cout << "\tbitblade: Grenz-ICM " << bandv.size() << " Flaechen, " << changed_total << " Aenderungen, Energie "
++              << (long long)bb_energy(data_costs, *graph, label) << ", gesamt " << timer.get_elapsed_sec() << " s" << std::endl;
++
++    std::size_t undefined = 0;
++    for (std::size_t i = 0; i < N; ++i) { if (label[i] == 0) ++undefined; graph->set_label(i, label[i]); }
++    std::cout << '\t' << undefined << " faces have not been seen" << std::endl;
++    return true;
++}
++
++double
++bb_labeling_energy(DataCosts const & data_costs, UniGraph const & graph) {
++    std::vector<std::uint32_t> lab(graph.num_nodes());
++    for (std::size_t i = 0; i < graph.num_nodes(); ++i) lab[i] = (std::uint32_t)graph.get_label(i);
++    return bb_energy(data_costs, graph, lab);
++}
++
+ TEX_NAMESPACE_END
+-- 
+2.43.0
+
