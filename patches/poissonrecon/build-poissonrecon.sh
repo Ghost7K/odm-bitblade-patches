@@ -17,6 +17,11 @@ mkdir -p "$W" && cd "$W"
 rm -rf PoissonRecon
 git clone -q https://github.com/OpenDroneMap/PoissonRecon.git
 cd PoissonRecon && git checkout -q 97caa6d
-make -j"$J" poissonrecon CFLAGS_RELEASE="-O3 -DRELEASE -ffast-math -g -DBIG_DATA" >/dev/null
+# Src/PreProcessor.h unconditionally does "#undef BIG_DATA" in this version, so -DBIG_DATA on the command line has
+# no effect - the switch has to be flipped in the header itself (this also enables USE_DEEP_TREE_NODES).
+grep -q '^#undef BIG_DATA' Src/PreProcessor.h
+sed -i 's|^#undef BIG_DATA|#define BIG_DATA|' Src/PreProcessor.h
+grep -q '^#define BIG_DATA' Src/PreProcessor.h
+make -j"$J" poissonrecon CFLAGS_RELEASE="-O3 -DRELEASE -ffast-math -g" >/dev/null
 cp Bin/Linux/PoissonRecon "$W/PoissonRecon.bb" && strip "$W/PoissonRecon.bb"
 echo "OK: $W/PoissonRecon.bb"
