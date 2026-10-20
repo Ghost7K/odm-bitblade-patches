@@ -10,12 +10,13 @@ Most patches keep the **output identical** to stock ODM (byte- or MD5-identical 
 error, and can be switched off at runtime with a flag file.
 
 The strongest patches are being submitted upstream as well – see [docs/UPSTREAM.md](docs/UPSTREAM.md).
+Open work items (bugs and requests collected from the OpenDroneMap forum) are tracked as [issues](https://github.com/Ghost7K/odm-bitblade-patches/issues).
 
 ## Results at a glance
 
 | Patch | Stage / component | What it fixes | Measured effect |
 |---|---|---|---|
-| **13** PoissonRecon `BIG_DATA` | odm_meshing | 32-bit octree node index overflows at depth 13 → deterministic segfault | 554 M points, depth 13: crash → **completes** (26 min, 102 GB peak) |
+| **13** PoissonRecon `BIG_DATA` | odm_meshing | 32-bit octree node index overflows at depth 13 → deterministic segfault | 554 M points, depth 13: crash → **completes** (26 min, 102 GB peak). Used only as fallback after a crash: BIG_DATA needs ~45–60 % more RAM |
 | **9** Poisson safety net | odm_meshing | a Poisson crash kills the whole task | retries with depth −1/−2 instead of failing |
 | **10, 22–29** texrecon | mvs_texturing | quadratic `reserve()` in mapmap, serial patch/atlas code, all atlases held in RAM, quality normalisation clamped to 0 | 4,700 images / 19.4 M faces: 3D **45 → 26 min, RAM 191 → 108 GB**; 2.5D ~3 h 50 / ~450 GB → **15–20 min / ~105 GB**; visibly better ortho view selection |
 | **22** glass fallback | mvs_texturing | glass/window faces get no view and are deleted → holes | deleted faces on a glass-facade dataset **416,648 → 2,921**, same runtime |
@@ -77,7 +78,7 @@ Create the flag file in `/var/www/data/` (the NodeODM data volume) – no restar
 |---|---|
 | `bitblade_texrecon_orig` | original texrecon (all texturing patches off) |
 | `bitblade_tex_mrf_aus`, `bitblade_tex_topk_aus`, `bitblade_tex_visfix_aus`, `bitblade_tex_fallback_aus` | individual texrecon patches 28 / 27 / 29 / 22 off |
-| `bitblade_poisson_orig` | original PoissonRecon (safety net stays) |
+| `bitblade_poisson_orig` | no BIG_DATA fallback (depth safety net stays) |
 | `bitblade_p41_aus` | original FPCFilter |
 | `bitblade_p40_aus` | OpenSfM parallel exports/tracks/statistics and parallel EXIF reading off |
 | `bitblade_undistort_fork_aus` | undistort with threads again |
