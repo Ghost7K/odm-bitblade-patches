@@ -13,8 +13,9 @@ Patches we have submitted to the OpenDroneMap projects, and the ones we plan to 
 
 ## Planned (in this order)
 
-1. **PoissonRecon `BIG_DATA`** (Patch 13) – a one-flag change in ODM's SuperBuild; fixes a deterministic segfault
-   at depth 13 on dense scenes, output unchanged.
+1. **PoissonRecon `BIG_DATA`** (Patch 13) – fixes a deterministic segfault at depth 13 on dense scenes. Because the
+   BIG_DATA build needs ~45–60 % more RAM, the PR builds it as a second binary that ODM only uses after the normal
+   build crashed (issue #4).
 2. **OpenSfM exports** (Patch 40) – start with the list→set fix in `export_visualsfm` (byte-identical, ×5.9),
    then `export_openmvs` and `create_tracks`.
 3. **OpenSfM undistort with processes** (Patch 34) – ×12.5, bit-identical.
