@@ -17,6 +17,7 @@ Patches we have submitted to the OpenDroneMap projects, and the ones we plan to 
 | Issue #3 – video2dataset: keep RTK altitude precision, decimal/negative RTK altitude | [OpenDroneMap/ODM#2088](https://github.com/OpenDroneMap/ODM/pull/2088) | open |
 | Issue #6 – rasterio fallback for TIFFs without PhotometricInterpretation | [OpenDroneMap/ODM#2089](https://github.com/OpenDroneMap/ODM/pull/2089) | open |
 | Issue #5 – pairs_selection: all-nadir altitude search, relative_altitude sanitizing | [OpenDroneMap/OpenSfM#55](https://github.com/OpenDroneMap/OpenSfM/pull/55) | open |
+| Issue #13 – NoData = 0 on float (multispectral/thermal) orthophotos, clamp negative edge reflectance (NDVI −153…+146 → −1…1) | [OpenDroneMap/ODM#2090](https://github.com/OpenDroneMap/ODM/pull/2090) | open |
 
 ## Planned (in this order)
 
